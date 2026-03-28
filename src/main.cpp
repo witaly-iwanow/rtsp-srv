@@ -1,4 +1,3 @@
-#include <cctype>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -12,21 +11,20 @@ struct ServerConfig {
     std::uint16_t port;
 };
 
-bool is_digits(const std::string& value) {
-    if (value.empty())
-        return false;
-    for (const unsigned char ch: value)
-        if (!std::isdigit(ch))
-            return false;
-    return true;
-}
-
 std::uint16_t parse_port(const std::string& port_text) {
-    if (!is_digits(port_text))
+    int parsed_port = 0;
+    try {
+        parsed_port = std::stoi(port_text);
+    } catch (const std::exception&) {
         throw std::invalid_argument("port must be numeric");
-    const int parsed_port = std::stoi(port_text);
+    }
+
+    if (std::to_string(parsed_port) != port_text)
+        throw std::invalid_argument("port must be numeric");
+
     if (parsed_port <= 0 || parsed_port > 65535)
         throw std::out_of_range("port must be in range 1..65535");
+
     return static_cast<std::uint16_t>(parsed_port);
 }
 
@@ -34,7 +32,7 @@ void parse_bind(ServerConfig& cfg, const std::string& bind) {
     if (bind.empty())
         throw std::invalid_argument("bind must not be empty");
 
-    if (is_digits(bind)) {
+    if (bind.find(':') == std::string::npos) {
         cfg.port = parse_port(bind);
         return;
     }

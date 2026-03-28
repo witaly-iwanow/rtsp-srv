@@ -3,6 +3,7 @@
 #include "session.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cctype>
@@ -72,9 +73,9 @@ std::string sockaddr_to_string(const sockaddr_storage& addr) {
 }
 
 std::string to_lower(std::string value) {
-    for (char& ch: value)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
     return value;
 }
 

@@ -1,6 +1,7 @@
 #include "session.h"
 #include "logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -25,14 +26,16 @@ struct RtspRequest {
 std::atomic<std::uint64_t> g_session_counter {1};
 
 std::string to_lower(std::string value) {
-    for (char& ch: value)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
     return value;
 }
 
 std::string to_upper(std::string value) {
-    for (char& ch: value)
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return std::toupper(c);
+    });
     return value;
 }
 
