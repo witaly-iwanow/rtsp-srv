@@ -50,10 +50,36 @@ std::string trim(const std::string& value) {
 }
 
 std::string strip_track_suffix(const std::string& uri) {
-    const std::size_t pos = uri.find("/trackID=");
+    const std::size_t pos = uri.rfind("/trackID=");
     if (pos == std::string::npos)
         return uri;
     return uri.substr(0, pos);
+}
+
+bool parse_track_id(const std::string& uri, int& track_id) {
+    const std::size_t pos = uri.rfind("/trackID=");
+    if (pos == std::string::npos)
+        return false;
+
+    std::string value = uri.substr(pos + std::strlen("/trackID="));
+    const std::size_t suffix = value.find_first_of("?#");
+    if (suffix != std::string::npos)
+        value = value.substr(0, suffix);
+    if (value.empty())
+        return false;
+
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value);
+    } catch (const std::exception&) {
+        return false;
+    }
+
+    if (std::to_string(parsed) != value)
+        return false;
+
+    track_id = parsed;
+    return true;
 }
 
 std::size_t parse_content_length(const std::string& headers) {
@@ -208,7 +234,10 @@ std::string make_sdp(const std::string& media_name) {
         << "a=control:*\r\n"
         << "m=video 0 RTP/AVP 96\r\n"
         << "a=rtpmap:96 H264/90000\r\n"
-        << "a=control:trackID=0\r\n";
+        << "a=control:trackID=0\r\n"
+        << "m=audio 0 RTP/AVP 97\r\n"
+        << "a=rtpmap:97 opus/48000/2\r\n"
+        << "a=control:trackID=1\r\n";
     return sdp.str();
 }
 
@@ -332,16 +361,25 @@ bool Session::start_streaming() {
     const std::lock_guard<std::mutex> lock(stream_mutex_);
     if (ffmpeg_pid_ > 0)
         return true;
-    if (current_media_path_.empty() || client_rtp_port_ == 0)
+    if (current_media_path_.empty() || !video_ports_.setup || video_ports_.client_rtp == 0)
         return false;
 
     const std::string host = endpoint_host(remote_endpoint_);
     if (host.empty())
         return false;
-    const std::string rtp_url = make_rtp_url(host, client_rtp_port_);
+
+    const std::string video_rtp_url = make_rtp_url(host, video_ports_.client_rtp);
+    const bool stream_audio = audio_ports_.setup && audio_ports_.client_rtp != 0;
+    std::string audio_rtp_url;
+    if (stream_audio)
+        audio_rtp_url = make_rtp_url(host, audio_ports_.client_rtp);
+
     LOG << "Starting ffmpeg: -re -stream_loop -1 -i " << current_media_path_
-        << " -an -map 0:v:0 -c:v libx264 -profile:v high -preset faster -crf 23 -pix_fmt yuv420p"
-        << " -f rtp -payload_type 96 " << rtp_url;
+        << " -map 0:v:0 -c:v libx264 -profile:v high -preset faster -crf 23 -pix_fmt yuv420p"
+        << " -f rtp -payload_type 96 " << video_rtp_url;
+    if (stream_audio)
+        LOG << "Starting ffmpeg audio: -map 0:a:0 -c:a libopus -ac 2 -ar 48000 -f rtp -payload_type 97 "
+            << audio_rtp_url;
 
     const pid_t pid = fork();
     if (pid < 0) {
@@ -349,36 +387,80 @@ bool Session::start_streaming() {
         return false;
     }
     if (pid == 0) {
-        execlp(
-            "ffmpeg",
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-re",
-            "-stream_loop",
-            "-1",
-            "-i",
-            current_media_path_.c_str(),
-            "-an",
-            "-map",
-            "0:v:0",
-            "-c:v",
-            "libx264",
-            "-profile:v",
-            "high",
-            "-preset",
-            "faster",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "rtp",
-            "-payload_type",
-            "96",
-            rtp_url.c_str(),
-            static_cast<char*>(nullptr));
+        if (stream_audio) {
+            execlp(
+                "ffmpeg",
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-stream_loop",
+                "-1",
+                "-i",
+                current_media_path_.c_str(),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-preset",
+                "faster",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "rtp",
+                "-payload_type",
+                "96",
+                video_rtp_url.c_str(),
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "libopus",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-f",
+                "rtp",
+                "-payload_type",
+                "97",
+                audio_rtp_url.c_str(),
+                nullptr);
+        } else {
+            execlp(
+                "ffmpeg",
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-stream_loop",
+                "-1",
+                "-i",
+                current_media_path_.c_str(),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-preset",
+                "faster",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "rtp",
+                "-payload_type",
+                "96",
+                video_rtp_url.c_str(),
+                nullptr);
+        }
         _exit(127);
     }
 
@@ -429,7 +511,7 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         if (!parse_media_relative_path(request.uri, rel_path))
             return send_response(400, "Bad Request", cseq, {}, "");
 
-        const std::filesystem::path media_path = media_dir_ / rel_path;
+        const auto media_path = media_dir_ / rel_path;
         if (!std::filesystem::exists(media_path))
             return send_response(404, "Not Found", cseq, {}, "");
 
@@ -460,19 +542,43 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         std::filesystem::path rel_path;
         if (!parse_media_relative_path(media_uri, rel_path))
             return send_response(400, "Bad Request", cseq, {}, "");
-        if (!std::filesystem::exists(media_dir_ / rel_path))
+        const auto media_path = media_dir_ / rel_path;
+        if (!std::filesystem::exists(media_path))
             return send_response(404, "Not Found", cseq, {}, "");
+
+        int track_id = -1;
+        if (!parse_track_id(request.uri, track_id) || (track_id != 0 && track_id != 1))
+            return send_response(400, "Bad Request", cseq, {}, "");
+
+        if (!session_id_.empty()) {
+            const std::string req_session = session_id_only(get_header(request, "session"));
+            if (!req_session.empty() && req_session != session_id_)
+                return send_response(454, "Session Not Found", cseq, {}, "");
+        }
+
+        if (!current_media_path_.empty() && current_media_path_ != media_path) {
+            stop_streaming();
+            video_ports_.setup = false;
+            audio_ports_.setup = false;
+        }
 
         if (session_id_.empty())
             session_id_ = make_session_id();
         current_media_uri_ = media_uri;
-        current_media_path_ = media_dir_ / rel_path;
-        client_rtp_port_ = parsed_rtp;
-        client_rtcp_port_ = parsed_rtcp;
+        current_media_path_ = media_path;
+
+        TrackPorts* ports = nullptr;
+        if (track_id == 0)
+            ports = &video_ports_;
+        else
+            ports = &audio_ports_;
+        ports->client_rtp = parsed_rtp;
+        ports->client_rtcp = parsed_rtcp;
+        ports->setup = true;
 
         std::ostringstream transport_reply;
-        transport_reply << "RTP/AVP;unicast;client_port=" << client_rtp_port_ << '-' << client_rtcp_port_
-                        << ";server_port=" << server_rtp_port_ << '-' << server_rtcp_port_;
+        transport_reply << "RTP/AVP;unicast;client_port=" << ports->client_rtp << '-' << ports->client_rtcp
+                        << ";server_port=" << ports->server_rtp << '-' << ports->server_rtcp;
         return send_response(
             200,
             "OK",
@@ -488,17 +594,26 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         const std::string req_session = session_id_only(get_header(request, "session"));
         if (!req_session.empty() && req_session != session_id_)
             return send_response(454, "Session Not Found", cseq, {}, "");
-        if (current_media_path_.empty() || client_rtp_port_ == 0)
+        if (current_media_path_.empty() || !video_ports_.setup || video_ports_.client_rtp == 0)
             return send_response(455, "Method Not Valid In This State", cseq, {}, "");
         if (!std::filesystem::exists(current_media_path_))
             return send_response(404, "Not Found", cseq, {}, "");
+
         if (!start_streaming())
             return send_response(500, "Internal Server Error", cseq, {}, "");
 
         std::vector<std::pair<std::string, std::string>> headers;
         headers.emplace_back("Session", session_id_);
-        if (!current_media_uri_.empty())
-            headers.emplace_back("RTP-Info", "url=" + current_media_uri_ + "/trackID=0;seq=0;rtptime=0");
+        if (!current_media_uri_.empty()) {
+            std::string base = current_media_uri_;
+            if (base.back() != '/')
+                base += '/';
+
+            std::string rtp_info = "url=" + base + "trackID=0;seq=0;rtptime=0";
+            if (audio_ports_.setup)
+                rtp_info += ",url=" + base + "trackID=1;seq=0;rtptime=0";
+            headers.emplace_back("RTP-Info", rtp_info);
+        }
         return send_response(200, "OK", cseq, headers, "");
     }
 

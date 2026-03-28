@@ -23,6 +23,14 @@ public:
     Session& operator=(const Session&) = delete;
 
 private:
+    struct TrackPorts {
+        std::uint16_t client_rtp = 0;
+        std::uint16_t client_rtcp = 0;
+        std::uint16_t server_rtp = 0;
+        std::uint16_t server_rtcp = 0;
+        bool setup = false;
+    };
+
     bool send_raw(const std::string& data);
     bool send_response(
         int status_code,
@@ -40,10 +48,8 @@ private:
     std::filesystem::path media_dir_;
     std::string session_id_;
     std::string current_media_uri_;
-    std::uint16_t client_rtp_port_ = 0;
-    std::uint16_t client_rtcp_port_ = 0;
-    std::uint16_t server_rtp_port_ = 50000;
-    std::uint16_t server_rtcp_port_ = 50001;
+    TrackPorts video_ports_ {0, 0, 50000, 50001, false};
+    TrackPorts audio_ports_ {0, 0, 50002, 50003, false};
     std::filesystem::path current_media_path_;
     pid_t ffmpeg_pid_ = -1;
     mutable std::mutex stream_mutex_;
