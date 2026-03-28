@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <sys/types.h>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,8 @@ private:
         const std::string& cseq,
         const std::vector<std::pair<std::string, std::string>>& headers,
         const std::string& body);
+    bool start_streaming();
+    void stop_streaming();
     bool handle_request(const std::string& raw_request, bool& should_close);
     static std::string make_session_id();
 
@@ -41,5 +44,8 @@ private:
     std::uint16_t client_rtcp_port_ = 0;
     std::uint16_t server_rtp_port_ = 50000;
     std::uint16_t server_rtcp_port_ = 50001;
+    std::filesystem::path current_media_path_;
+    pid_t ffmpeg_pid_ = -1;
+    mutable std::mutex stream_mutex_;
     mutable std::mutex fd_mutex_;
 };

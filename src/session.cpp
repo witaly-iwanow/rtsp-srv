@@ -7,9 +7,11 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unordered_map>
 #include <unistd.h>
 
@@ -223,9 +225,32 @@ std::string session_id_only(const std::string& session_header) {
     return trim(session_header.substr(0, semi));
 }
 
+std::string endpoint_host(const std::string& endpoint) {
+    if (endpoint.empty())
+        return "";
+    if (endpoint.front() == '[') {
+        const std::size_t close = endpoint.find(']');
+        if (close == std::string::npos || close <= 1)
+            return "";
+        return endpoint.substr(1, close - 1);
+    }
+    const std::size_t colon = endpoint.rfind(':');
+    if (colon == std::string::npos || colon == 0)
+        return "";
+    return endpoint.substr(0, colon);
+}
+
+std::string make_rtp_url(const std::string& host, std::uint16_t port) {
+    if (host.find(':') != std::string::npos)
+        return "rtp://[" + host + "]:" + std::to_string(port) + "?pkt_size=1200";
+    return "rtp://" + host + ":" + std::to_string(port) + "?pkt_size=1200";
+}
+
 }  // namespace
 
 Session::~Session() {
+    stop_streaming();
+
     const std::lock_guard<std::mutex> lock(fd_mutex_);
     if (client_fd_ >= 0) {
         close(client_fd_);
@@ -234,6 +259,8 @@ Session::~Session() {
 }
 
 void Session::shutdown() {
+    stop_streaming();
+
     const std::lock_guard<std::mutex> lock(fd_mutex_);
     if (client_fd_ < 0)
         return;
@@ -301,6 +328,91 @@ bool Session::send_response(
     return send_raw(response.str());
 }
 
+bool Session::start_streaming() {
+    const std::lock_guard<std::mutex> lock(stream_mutex_);
+    if (ffmpeg_pid_ > 0)
+        return true;
+    if (current_media_path_.empty() || client_rtp_port_ == 0)
+        return false;
+
+    const std::string host = endpoint_host(remote_endpoint_);
+    if (host.empty())
+        return false;
+    const std::string rtp_url = make_rtp_url(host, client_rtp_port_);
+    LOG << "Starting ffmpeg: -re -stream_loop -1 -i " << current_media_path_
+        << " -an -map 0:v:0 -c:v libx264 -profile:v high -preset faster -crf 23 -pix_fmt yuv420p"
+        << " -f rtp -payload_type 96 " << rtp_url;
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        LOG << "fork() failed for ffmpeg: " << std::strerror(errno);
+        return false;
+    }
+    if (pid == 0) {
+        execlp(
+            "ffmpeg",
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-stream_loop",
+            "-1",
+            "-i",
+            current_media_path_.c_str(),
+            "-an",
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-preset",
+            "faster",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rtp",
+            "-payload_type",
+            "96",
+            rtp_url.c_str(),
+            static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    ffmpeg_pid_ = pid;
+    return true;
+}
+
+void Session::stop_streaming() {
+    pid_t pid = -1;
+    {
+        const std::lock_guard<std::mutex> lock(stream_mutex_);
+        if (ffmpeg_pid_ <= 0)
+            return;
+        pid = ffmpeg_pid_;
+        ffmpeg_pid_ = -1;
+    }
+
+    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
+        LOG << "kill(SIGTERM) failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
+
+    int status = 0;
+    const pid_t waited = waitpid(pid, &status, 0);
+    if (waited < 0) {
+        if (errno != ECHILD)
+            LOG << "waitpid() failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
+        return;
+    }
+
+    if (WIFEXITED(status))
+        LOG << "ffmpeg exited with code " << WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+        LOG << "ffmpeg terminated by signal " << WTERMSIG(status);
+}
+
 bool Session::handle_request(const std::string& raw_request, bool& should_close) {
     RtspRequest request;
     if (!parse_rtsp_request(raw_request, request))
@@ -354,6 +466,7 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         if (session_id_.empty())
             session_id_ = make_session_id();
         current_media_uri_ = media_uri;
+        current_media_path_ = media_dir_ / rel_path;
         client_rtp_port_ = parsed_rtp;
         client_rtcp_port_ = parsed_rtcp;
 
@@ -375,20 +488,25 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         const std::string req_session = session_id_only(get_header(request, "session"));
         if (!req_session.empty() && req_session != session_id_)
             return send_response(454, "Session Not Found", cseq, {}, "");
+        if (current_media_path_.empty() || client_rtp_port_ == 0)
+            return send_response(455, "Method Not Valid In This State", cseq, {}, "");
+        if (!std::filesystem::exists(current_media_path_))
+            return send_response(404, "Not Found", cseq, {}, "");
+        if (!start_streaming())
+            return send_response(500, "Internal Server Error", cseq, {}, "");
 
         std::vector<std::pair<std::string, std::string>> headers;
         headers.emplace_back("Session", session_id_);
         if (!current_media_uri_.empty())
             headers.emplace_back("RTP-Info", "url=" + current_media_uri_ + "/trackID=0;seq=0;rtptime=0");
-        const bool ok = send_response(200, "OK", cseq, headers, "");
-        LOG << "PLAY requested for " << current_media_uri_ << " (streaming not implemented yet)";
-        return ok;
+        return send_response(200, "OK", cseq, headers, "");
     }
 
     if (request.method == "TEARDOWN") {
         std::vector<std::pair<std::string, std::string>> headers;
         if (!session_id_.empty())
             headers.emplace_back("Session", session_id_);
+        stop_streaming();
         should_close = true;
         return send_response(200, "OK", cseq, headers, "");
     }
@@ -424,6 +542,8 @@ void Session::run() {
             }
         }
     }
+
+    stop_streaming();
 
     const std::lock_guard<std::mutex> lock(fd_mutex_);
     if (client_fd_ >= 0) {
