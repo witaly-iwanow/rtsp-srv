@@ -15,7 +15,7 @@ struct ServerConfig {
 bool is_digits(const std::string& value) {
     if (value.empty())
         return false;
-    for (const unsigned char ch : value)
+    for (const unsigned char ch: value)
         if (!std::isdigit(ch))
             return false;
     return true;

@@ -89,7 +89,7 @@ bool is_supported_extension(const std::filesystem::path& path) {
 
 std::size_t find_media_files(const std::filesystem::path& media_dir) {
     std::size_t count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(media_dir)) {
+    for (const auto& entry: std::filesystem::directory_iterator(media_dir)) {
         const auto& path = entry.path();
         if (is_regular_file(entry.status()) && is_supported_extension(path)) {
             ++count;
@@ -170,7 +170,7 @@ int open_listener(const std::string& host, std::uint16_t port) {
 
 void RtspServer::start_session(int client_fd, const std::string& remote_endpoint) {
     SessionWorker worker;
-    worker.session = std::make_unique<Session>(client_fd, remote_endpoint);
+    worker.session = std::make_unique<Session>(client_fd, remote_endpoint, media_dir_);
     worker.done = std::make_shared<std::atomic<bool>>(false);
     Session* session_ptr = worker.session.get();
     const std::shared_ptr<std::atomic<bool>> done = worker.done;
@@ -218,7 +218,7 @@ void RtspServer::cleanup_stale_sessions() {
             sessions_cv_.wait(lock, [this]() {
                 if (stop_reaper_)
                     return true;
-                for (const auto& worker : sessions_)
+                for (const auto& worker: sessions_)
                     if (worker.done && worker.done->load(std::memory_order_acquire))
                         return true;
                 return false;
@@ -238,7 +238,7 @@ void RtspServer::cleanup_stale_sessions() {
             }
         }
 
-        for (auto& worker : finished)
+        for (auto& worker: finished)
             if (worker.thread.joinable())
                 worker.thread.join();
     }
