@@ -1,10 +1,12 @@
 #include "rtsp_server.h"
 #include "logger.h"
+#include "session.h"
 
 #include <arpa/inet.h>
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <csignal>
 #include <cstring>
 #include <netdb.h>
 #include <filesystem>
@@ -19,10 +21,35 @@ namespace {
 // max backlog for pending connections
 constexpr int kBacklog = 10;
 constexpr std::array<const char*, 5> kSupportedExtensions = {".mp4", ".mkv", ".webm", ".mov", ".flv"};
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+static void on_stop_signal(int) {
+    g_stop_requested = 1;
+}
+
+void install_signal_handlers() {
+    struct sigaction stop_sa {};
+    stop_sa.sa_handler = on_stop_signal;
+    sigemptyset(&stop_sa.sa_mask);
+    stop_sa.sa_flags = 0;  // do not restart accept(); we want EINTR on Ctrl-C
+    if (sigaction(SIGTERM, &stop_sa, nullptr) < 0)
+        LOG << "sigaction(SIGTERM) failed: " << std::strerror(errno);
+    if (sigaction(SIGINT, &stop_sa, nullptr) < 0)
+        LOG << "sigaction(SIGINT) failed: " << std::strerror(errno);
+
+    // to avoid crashing on writing to closed sockets when clients disconnect abruptly
+    struct sigaction ignore_sa {};
+    ignore_sa.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_sa.sa_mask);
+    ignore_sa.sa_flags = 0;
+    if (sigaction(SIGPIPE, &ignore_sa, nullptr) < 0)
+        LOG << "sigaction(SIGPIPE) failed: " << std::strerror(errno);
+}
 
 const void* get_in_addr(const sockaddr* sa) {
     if (sa->sa_family == AF_INET)
         return &reinterpret_cast<const sockaddr_in*>(sa)->sin_addr;
+
     return &reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr;
 }
 
@@ -40,12 +67,14 @@ std::string sockaddr_to_string(const sockaddr_storage& addr) {
 
     if (addr.ss_family == AF_INET6)
         return std::string("[") + ip + "]:" + std::to_string(port);
+
     return std::string(ip) + ":" + std::to_string(port);
 }
 
 std::string to_lower(std::string value) {
     for (char& ch: value)
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
     return value;
 }
 
@@ -54,6 +83,7 @@ bool is_supported_extension(const std::filesystem::path& path) {
     for (auto supported: kSupportedExtensions)
         if (ext == supported)
             return true;
+
     return false;
 }
 
@@ -66,6 +96,7 @@ std::size_t find_media_files(const std::filesystem::path& media_dir) {
             LOG << "Media #" << count << ": " << path.filename();
         }
     }
+
     return count;
 }
 
@@ -91,35 +122,44 @@ int open_listener(const std::string& host, std::uint16_t port) {
     ListenerGuard listener;
     const auto service = std::to_string(port);
     const int rv = getaddrinfo(nullptr, service.c_str(), &hints, &listener.ai);
-    if (rv != 0 || !listener.ai)
-        throw std::runtime_error(std::string("getaddrinfo for ") + host + ":" + service + " failed with " + gai_strerror(rv));
+    if (rv != 0 || !listener.ai) {
+        LOG << "getaddrinfo for " << host << ":" << service << " failed with " << gai_strerror(rv);
+        return -1;
+    }
 
-    std::string bind_errors;
     for (addrinfo* p = listener.ai; p; p = p->ai_next) {
         if ((listener.fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
             continue;
 
-        // SO_REUSEADDR is omitted on purpose: error out if the port is already in use, to avoid confusion
+        int yes = 1;
+        if (setsockopt(listener.fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes)))
+            LOG << "setsockopt(SO_REUSEADDR) failed";   // not critical, just log and continue
 
         if (bind(listener.fd, p->ai_addr, p->ai_addrlen)) {
             const int bind_errno = errno;
             if (bind_errno == EACCES && port < 1024)
-                bind_errors += ", privileged port " + std::to_string(port) + " requires sudo or CAP_NET_BIND_SERVICE";
+                LOG << "Privileged port " << port << " requires sudo or CAP_NET_BIND_SERVICE";
             else
-                bind_errors += ", bind() failed with " + std::string(std::strerror(bind_errno));
+                LOG << "bind() failed with " << std::strerror(bind_errno);
+
             close(listener.fd);
             listener.fd = -1;
+
             continue;
         }
 
         break;
     }
 
-    if (listener.fd < 0)
-        throw std::runtime_error("failed to bind listening socket" + bind_errors);
+    if (listener.fd < 0) {
+        LOG << "Failed to bind to " << host << ":" << service;
+        return -1;
+    }
 
-    if (listen(listener.fd, kBacklog) < 0)
-        throw std::runtime_error("listen failed with " + std::string(std::strerror(errno)));
+    if (listen(listener.fd, kBacklog) < 0) {
+        LOG << "listen failed with " << std::strerror(errno);
+        return -1;
+    }
 
     auto fd = listener.fd;
     listener.fd = -1; // so that it doesn't get closed by the guard
@@ -128,10 +168,92 @@ int open_listener(const std::string& host, std::uint16_t port) {
 
 }  // namespace
 
+void RtspServer::start_session(int client_fd, const std::string& remote_endpoint) {
+    SessionWorker worker;
+    worker.session = std::make_unique<Session>(client_fd, remote_endpoint);
+    worker.done = std::make_shared<std::atomic<bool>>(false);
+    Session* session_ptr = worker.session.get();
+    const std::shared_ptr<std::atomic<bool>> done = worker.done;
+    worker.thread = std::thread([this, session_ptr, remote_endpoint, done]() {
+        const int active = active_sessions_.fetch_add(1) + 1;
+        LOG << "client connected: " << remote_endpoint << ", active sessions: " << active;
+        session_ptr->run();
+        const int after = active_sessions_.fetch_sub(1) - 1;
+        LOG << "client disconnected: " << remote_endpoint << ", active sessions: " << after;
+        done->store(true, std::memory_order_release);
+        sessions_cv_.notify_one();
+    });
+
+    const std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_.push_back(std::move(worker));
+    sessions_cv_.notify_one();
+}
+
+void RtspServer::shutdown_sessions() {
+    std::vector<SessionWorker> workers;
+    {
+        const std::lock_guard<std::mutex> lock(sessions_mutex_);
+        workers.swap(sessions_);
+    }
+
+    if (workers.empty()) {
+        LOG << "No active sessions to shutdown";
+        return;
+    }
+
+    LOG << "Stopping " << workers.size() << " sessions";
+    for (auto& worker: workers)
+        if (worker.session)
+            worker.session->shutdown();
+    for (auto& worker: workers)
+        if (worker.thread.joinable())
+            worker.thread.join();
+}
+
+void RtspServer::cleanup_stale_sessions() {
+    while (true) {
+        std::vector<SessionWorker> finished;
+        {
+            std::unique_lock<std::mutex> lock(sessions_mutex_);
+            sessions_cv_.wait(lock, [this]() {
+                if (stop_reaper_)
+                    return true;
+                for (const auto& worker : sessions_)
+                    if (worker.done && worker.done->load(std::memory_order_acquire))
+                        return true;
+                return false;
+            });
+
+            if (stop_reaper_)
+                return;
+
+            auto it = sessions_.begin();
+            while (it != sessions_.end()) {
+                if (it->done && it->done->load(std::memory_order_acquire)) {
+                    finished.push_back(std::move(*it));
+                    it = sessions_.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+        }
+
+        for (auto& worker : finished)
+            if (worker.thread.joinable())
+                worker.thread.join();
+    }
+}
+
 int RtspServer::run() {
+    bool expected = false;
+    if (!run_called_.compare_exchange_strong(expected, true)) {
+        LOG << "run() can be called only once per RtspServer instance";
+        return 1;
+    }
+
     if (!std::filesystem::exists(media_dir_) || !std::filesystem::is_directory(media_dir_)) {
         LOG << "Media directory does not exist or is not a directory: " << media_dir_;
-        return -1;
+        return 1;
     }
 
     LOG << "Serving media from " << media_dir_;
@@ -142,32 +264,48 @@ int RtspServer::run() {
 
         LOG << "No supported media files (" << supported_list << ") found in " << media_dir_;
 
-        return -1;
+        return 1;
     }
 
-    int listener = -1;
-    try {
-        listener = open_listener(host_, port_);
-    } catch (const std::exception& ex) {
-        LOG << "Failed to start listener: " << ex.what();
-        return -1;
-    }
+    int listener = open_listener(host_, port_);
+    if (listener < 0)
+        return 1;
+
+    install_signal_handlers();
+
+    std::thread reaper_thread(&RtspServer::cleanup_stale_sessions, this);
 
     LOG << "Listening on " << host_ << ':' << port_;
+    LOG << "Press Ctrl-C to stop";
 
-    while (true) {
+    while (!g_stop_requested) {
         sockaddr_storage client_addr {};
         socklen_t addr_len = sizeof(client_addr);
         const int client_fd = accept(listener, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client_fd < 0) {
+            if (errno == EINTR && g_stop_requested)
+                break;
+            if (errno == EINTR)
+                continue;
+
             LOG << "accept() failed: " << std::strerror(errno);
             continue;
         }
 
         const std::string remote_endpoint = sockaddr_to_string(client_addr);
-        std::thread([client_fd, remote_endpoint]() {
-            LOG << "client connected: " << remote_endpoint;
-            close(client_fd);
-        }).detach();
+        start_session(client_fd, remote_endpoint);
     }
+
+    LOG << "Shutting down";
+    {
+        const std::lock_guard<std::mutex> lock(sessions_mutex_);
+        stop_reaper_ = true;
+    }
+    sessions_cv_.notify_all();
+    if (reaper_thread.joinable())
+        reaper_thread.join();
+    shutdown_sessions();
+    close(listener);
+
+    return 0;
 }

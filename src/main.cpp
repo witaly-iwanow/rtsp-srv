@@ -1,12 +1,10 @@
-#include "rtsp_server.h"
-
 #include <cctype>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-namespace {
+#include "rtsp_server.h"
 
 struct ServerConfig {
     std::filesystem::path media_dir;
@@ -87,8 +85,6 @@ void print_usage(const char* exe_name) {
               << "  [::1]:8554\n"
               << "  ::1:8554\n";
 }
-
-}  // namespace
 
 int main(int argc, char** argv) {
     try {

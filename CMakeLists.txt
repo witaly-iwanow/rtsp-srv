@@ -19,6 +19,7 @@ find_package(Threads REQUIRED)
 add_executable(rtsp_server
     src/main.cpp
     src/rtsp_server.cpp
+    src/session.cpp
 )
 
 target_include_directories(rtsp_server PRIVATE src)
