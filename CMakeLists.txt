@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 
 # on Ubuntu 24.04 clang++ (18.1.3) produces much faster executables than g++ (13.3.0)
 set(CMAKE_CXX_COMPILER_NAMES clang++ g++ icpc c++ cxx)
-project(eccpp VERSION 1.0.0 LANGUAGES CXX)
+project(rtsp_srv VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
