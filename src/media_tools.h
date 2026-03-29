@@ -28,6 +28,7 @@ std::vector<std::string> make_ffmpeg_args(
     const MediaDescription& media,
     const std::string* video_rtp_url,
     const std::string* audio_rtp_url,
+    const std::string* rtp_cname,
     bool realtime,
     bool loop_input,
     const std::string* sdp_file = nullptr);

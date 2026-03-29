@@ -201,6 +201,7 @@ std::vector<std::string> make_ffmpeg_args(
     const MediaDescription& media,
     const std::string* video_rtp_url,
     const std::string* audio_rtp_url,
+    const std::string* rtp_cname,
     bool realtime,
     bool loop_input,
     const std::string* sdp_file) {
@@ -235,6 +236,10 @@ std::vector<std::string> make_ffmpeg_args(
             args.emplace_back("-pix_fmt");
             args.emplace_back("yuv420p");
         }
+        if (rtp_cname != nullptr) {
+            args.emplace_back("-cname");
+            args.emplace_back(*rtp_cname);
+        }
         args.emplace_back("-f");
         args.emplace_back("rtp");
         args.emplace_back(*video_rtp_url);
@@ -252,6 +257,10 @@ std::vector<std::string> make_ffmpeg_args(
             args.emplace_back("2");
             args.emplace_back("-ar");
             args.emplace_back("48000");
+        }
+        if (rtp_cname != nullptr) {
+            args.emplace_back("-cname");
+            args.emplace_back(*rtp_cname);
         }
         args.emplace_back("-f");
         args.emplace_back("rtp");
