@@ -12,7 +12,7 @@ cmake --build build -j
 ## Run
 
 ```bash
-./build/rtspsrv [media_directory] [[host:]port]
+./build/rtsp_server [media_directory] [[host:]port]
 ```
 
 Defaults:
@@ -23,7 +23,30 @@ Defaults:
 Examples:
 
 ```bash
-./build/rtspsrv . 8554
-sudo ./build/rtspsrv . 554
-./build/rtspsrv ~/media [::]:8554
+./build/rtsp_server . 8554
+sudo ./build/rtsp_server . 554
+./build/rtsp_server ~/media [::]:8554
+```
+
+## Docker
+
+Build the image:
+
+```bash
+docker build -t rtsp-srv:ubuntu24.04 .
+```
+
+Run it with a media directory mounted into `/media`. The container serves from `.` inside `/media`, matching the native default:
+
+```bash
+docker run --rm -it \
+  -p 554:554 \
+  -v "$PWD:/media:ro" \
+  rtsp-srv:ubuntu24.04
+```
+
+Then open media through RTSP, for example:
+
+```text
+rtsp://localhost:554/meridian-480.mp4
 ```
