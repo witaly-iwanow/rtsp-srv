@@ -26,7 +26,7 @@ bool probe_track(const std::filesystem::path& media_path, const char* selector, 
 std::vector<std::string> make_ffmpeg_args(
     const std::filesystem::path& media_path,
     const MediaDescription& media,
-    const std::string& video_rtp_url,
+    const std::string* video_rtp_url,
     const std::string* audio_rtp_url,
     bool realtime,
     bool loop_input,

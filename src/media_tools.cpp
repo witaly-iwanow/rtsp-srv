@@ -199,7 +199,7 @@ bool probe_track(const std::filesystem::path& media_path, const char* selector, 
 std::vector<std::string> make_ffmpeg_args(
     const std::filesystem::path& media_path,
     const MediaDescription& media,
-    const std::string& video_rtp_url,
+    const std::string* video_rtp_url,
     const std::string* audio_rtp_url,
     bool realtime,
     bool loop_input,
@@ -218,25 +218,27 @@ std::vector<std::string> make_ffmpeg_args(
         args.emplace_back(*sdp_file);
     }
 
-    args.emplace_back("-map");
-    args.emplace_back("0:v:0");
-    args.emplace_back("-c:v");
-    if (media.video.copy) {
-        args.emplace_back("copy");
-    } else {
-        args.emplace_back("libx264");
-        args.emplace_back("-profile:v");
-        args.emplace_back("high");
-        args.emplace_back("-preset");
-        args.emplace_back("faster");
-        args.emplace_back("-crf");
-        args.emplace_back("23");
-        args.emplace_back("-pix_fmt");
-        args.emplace_back("yuv420p");
+    if (video_rtp_url != nullptr && media.video.present) {
+        args.emplace_back("-map");
+        args.emplace_back("0:v:0");
+        args.emplace_back("-c:v");
+        if (media.video.copy) {
+            args.emplace_back("copy");
+        } else {
+            args.emplace_back("libx264");
+            args.emplace_back("-profile:v");
+            args.emplace_back("high");
+            args.emplace_back("-preset");
+            args.emplace_back("faster");
+            args.emplace_back("-crf");
+            args.emplace_back("23");
+            args.emplace_back("-pix_fmt");
+            args.emplace_back("yuv420p");
+        }
+        args.emplace_back("-f");
+        args.emplace_back("rtp");
+        args.emplace_back(*video_rtp_url);
     }
-    args.emplace_back("-f");
-    args.emplace_back("rtp");
-    args.emplace_back(video_rtp_url);
 
     if (audio_rtp_url != nullptr && media.audio.present) {
         args.emplace_back("-map");
