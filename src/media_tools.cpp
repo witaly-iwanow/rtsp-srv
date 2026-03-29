@@ -235,6 +235,8 @@ std::vector<std::string> make_ffmpeg_args(
             args.emplace_back("high");
             args.emplace_back("-preset");
             args.emplace_back("faster");
+            args.emplace_back("-g");
+            args.emplace_back("100");
             args.emplace_back("-crf");
             args.emplace_back("23");
             args.emplace_back("-pix_fmt");
