@@ -21,7 +21,7 @@ struct MediaDescription {
 
 std::string join_command(const std::vector<std::string>& args);
 pid_t spawn_process(const std::vector<std::string>& args, int stdout_fd = -1, int stderr_fd = -1);
-bool wait_for_process(pid_t pid, const char* process_name, bool log_exit = true);
+bool wait_for_process(pid_t pid, const std::string& process_name, bool log_exit = true);
 bool probe_track(const std::filesystem::path& media_path, const char* selector, bool is_video, MediaTrack& track);
 std::vector<std::string> make_ffmpeg_args(
     const std::filesystem::path& media_path,

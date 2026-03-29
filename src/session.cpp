@@ -2,13 +2,13 @@
 #include "logger.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -26,8 +26,6 @@ struct RtspRequest {
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 };
-
-std::atomic<std::uint64_t> g_session_counter {1};
 
 constexpr std::uint16_t kDescribeVideoRtpPort = 40000;
 constexpr std::uint16_t kDescribeAudioRtpPort = 40002;
@@ -56,10 +54,8 @@ bool track_id_is_audio(const MediaDescription& media, int track_id) {
     return track_id == audio_track_id(media);
 }
 
-std::string make_rtp_cname(const std::string& session_id) {
-    if (session_id.empty())
-        return "rtsp-srv";
-    return "rtsp-srv-" + session_id;
+std::string make_rtp_cname(std::uint32_t session_id) {
+    return "rtsp-srv-" + std::to_string(session_id);
 }
 
 std::string to_lower(std::string value) {
@@ -412,6 +408,13 @@ std::string make_rtp_url(const std::string& host, std::uint16_t port) {
 
 }  // namespace
 
+Session::Session(
+    int client_fd,
+    const std::string& remote_endpoint,
+    const std::filesystem::path& media_dir,
+    std::uint32_t session_id):
+    client_fd_(client_fd), remote_endpoint_(remote_endpoint), media_dir_(media_dir), session_id_(session_id) {}
+
 Session::~Session() {
     stop_streaming();
 
@@ -448,9 +451,26 @@ const std::string& Session::remote_endpoint() const {
     return remote_endpoint_;
 }
 
-std::string Session::make_session_id() {
-    const std::uint64_t id = g_session_counter.fetch_add(1, std::memory_order_relaxed);
-    return std::to_string(id);
+std::uint32_t Session::session_id() const {
+    return session_id_;
+}
+
+std::string Session::log_prefix() const {
+    std::ostringstream prefix;
+    prefix << '[' << std::hex << std::nouppercase << std::setw(6) << std::setfill('0') << (session_id_ & 0xFFFFFF) << ']';
+    return prefix.str();
+}
+
+Logger::Entry Session::log() const {
+    return Logger::Entry(Logger::instance(), log_prefix() + " ");
+}
+
+std::string Session::session_id_text() const {
+    return std::to_string(session_id_);
+}
+
+bool Session::has_setup_tracks() const {
+    return video_ports_.setup || audio_ports_.setup;
 }
 
 bool Session::send_raw(const std::string& data) {
@@ -511,16 +531,16 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
     current_media_ = std::move(media);
 
     if (current_media_.video.present) {
-        LOG << "Selected video codec " << current_media_.video.codec_name
+        log() << "selected video codec " << current_media_.video.codec_name
             << (current_media_.video.copy ? " via passthrough" : " via libx264 transcode");
     } else {
-        LOG << "No video track detected";
+        log() << "no video track detected";
     }
     if (current_media_.audio.present) {
-        LOG << "Selected audio codec " << current_media_.audio.codec_name
+        log() << "selected audio codec " << current_media_.audio.codec_name
             << (current_media_.audio.copy ? " via passthrough" : " via libopus transcode");
     } else {
-        LOG << "No audio track detected";
+        log() << "no audio track detected";
     }
 
     return true;
@@ -554,11 +574,11 @@ bool Session::start_streaming() {
     const std::string rtp_cname = make_rtp_cname(session_id_);
     const std::vector<std::string> args =
         make_ffmpeg_args(current_media_path_, current_media_, video_url, audio_url, &rtp_cname, true, true);
-    LOG << "Starting ffmpeg: " << join_command(args);
+    log() << "starting ffmpeg: " << join_command(args);
 
     const pid_t pid = spawn_process(args);
     if (pid < 0) {
-        LOG << "fork() failed for ffmpeg: " << std::strerror(errno);
+        log() << "fork() failed for ffmpeg: " << std::strerror(errno);
         return false;
     }
 
@@ -577,9 +597,9 @@ void Session::stop_streaming() {
     }
 
     if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
-        LOG << "kill(SIGTERM) failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
+        log() << "kill(SIGTERM) failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
 
-    wait_for_process(pid, "ffmpeg");
+    wait_for_process(pid, log_prefix() + " ffmpeg");
 }
 
 bool Session::handle_request(const std::string& raw_request, bool& should_close) {
@@ -587,7 +607,7 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
     if (!parse_rtsp_request(raw_request, request))
         return send_response(400, "Bad Request", "0", {}, "");
 
-    LOG << request.method;
+    log() << request.method;
     const std::string cseq = get_header(request, "cseq");
 
     if (request.method == "OPTIONS")
@@ -639,9 +659,9 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
         if (!parse_track_id(request.uri, track_id))
             return send_response(400, "Bad Request", cseq, {}, "");
 
-        if (!session_id_.empty()) {
+        if (has_setup_tracks()) {
             const std::string req_session = session_id_only(get_header(request, "session"));
-            if (!req_session.empty() && req_session != session_id_)
+            if (!req_session.empty() && req_session != session_id_text())
                 return send_response(454, "Session Not Found", cseq, {}, "");
         }
 
@@ -657,9 +677,6 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
 
         if (!track_id_is_valid(current_media_, track_id))
             return send_response(404, "Not Found", cseq, {}, "");
-
-        if (session_id_.empty())
-            session_id_ = make_session_id();
 
         TrackPorts* ports = nullptr;
         if (track_id_is_video(current_media_, track_id))
@@ -679,16 +696,16 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
             200,
             "OK",
             cseq,
-            {{"Session", session_id_}, {"Transport", transport_reply.str()}},
+            {{"Session", session_id_text()}, {"Transport", transport_reply.str()}},
             "");
     }
 
     if (request.method == "PLAY") {
-        if (session_id_.empty())
+        if (!has_setup_tracks())
             return send_response(454, "Session Not Found", cseq, {}, "");
 
         const std::string req_session = session_id_only(get_header(request, "session"));
-        if (!req_session.empty() && req_session != session_id_)
+        if (!req_session.empty() && req_session != session_id_text())
             return send_response(454, "Session Not Found", cseq, {}, "");
         const bool can_play_video = current_media_.video.present && video_ports_.setup && video_ports_.client_rtp != 0;
         const bool can_play_audio = current_media_.audio.present && audio_ports_.setup && audio_ports_.client_rtp != 0;
@@ -701,14 +718,14 @@ bool Session::handle_request(const std::string& raw_request, bool& should_close)
             return send_response(500, "Internal Server Error", cseq, {}, "");
 
         std::vector<std::pair<std::string, std::string>> headers;
-        headers.emplace_back("Session", session_id_);
+        headers.emplace_back("Session", session_id_text());
         return send_response(200, "OK", cseq, headers, "");
     }
 
     if (request.method == "TEARDOWN") {
         std::vector<std::pair<std::string, std::string>> headers;
-        if (!session_id_.empty())
-            headers.emplace_back("Session", session_id_);
+        if (has_setup_tracks())
+            headers.emplace_back("Session", session_id_text());
         stop_streaming();
         should_close = true;
         return send_response(200, "OK", cseq, headers, "");
@@ -729,7 +746,7 @@ void Session::run() {
         if (nread < 0) {
             if (errno == EINTR)
                 continue;
-            LOG << "recv() failed from " << remote_endpoint_ << ": " << std::strerror(errno);
+            log() << "recv() failed from " << remote_endpoint_ << ": " << std::strerror(errno);
             break;
         }
 

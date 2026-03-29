@@ -86,7 +86,7 @@ bool run_command_capture(const std::vector<std::string>& args, std::string& outp
                 continue;
             close(pipe_fds[0]);
             LOG << "read() failed while capturing command output: " << std::strerror(errno);
-            wait_for_process(pid, args.front().c_str(), false);
+            wait_for_process(pid, args.front(), false);
             return false;
         }
         if (nread == 0)
@@ -95,7 +95,7 @@ bool run_command_capture(const std::vector<std::string>& args, std::string& outp
     }
     close(pipe_fds[0]);
 
-    return wait_for_process(pid, args.front().c_str(), false);
+    return wait_for_process(pid, args.front(), false);
 }
 
 }  // namespace
@@ -124,7 +124,7 @@ pid_t spawn_process(const std::vector<std::string>& args, int stdout_fd, int std
     exec_command_args(args);
 }
 
-bool wait_for_process(pid_t pid, const char* process_name, bool log_exit) {
+bool wait_for_process(pid_t pid, const std::string& process_name, bool log_exit) {
     int status = 0;
     const pid_t waited = waitpid(pid, &status, 0);
     if (waited < 0) {
@@ -217,6 +217,10 @@ std::vector<std::string> make_ffmpeg_args(
     if (sdp_file != nullptr) {
         args.emplace_back("-sdp_file");
         args.emplace_back(*sdp_file);
+    } else if (video_rtp_url != nullptr || audio_rtp_url != nullptr) {
+        // Without an explicit sink ffmpeg prints generated SDP to stdout for RTP outputs.
+        args.emplace_back("-sdp_file");
+        args.emplace_back("/dev/null");
     }
 
     if (video_rtp_url != nullptr && media.video.present) {

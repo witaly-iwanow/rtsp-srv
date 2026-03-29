@@ -37,6 +37,7 @@ private:
     std::condition_variable sessions_cv_;
     std::vector<SessionWorker> sessions_;
     std::atomic<int> active_sessions_ {0};
+    std::atomic<std::uint32_t> next_session_id_ {1};
     std::atomic<bool> run_called_ {false};
     bool stop_reaper_ = false;
 };

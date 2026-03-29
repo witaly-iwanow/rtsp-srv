@@ -171,16 +171,17 @@ int open_listener(const std::string& host, std::uint16_t port) {
 
 void RtspServer::start_session(int client_fd, const std::string& remote_endpoint) {
     SessionWorker worker;
-    worker.session = std::make_unique<Session>(client_fd, remote_endpoint, media_dir_);
+    worker.session =
+        std::make_unique<Session>(client_fd, remote_endpoint, media_dir_, next_session_id_.fetch_add(1, std::memory_order_relaxed));
     worker.done = std::make_shared<std::atomic<bool>>(false);
     Session* session_ptr = worker.session.get();
     const std::shared_ptr<std::atomic<bool>> done = worker.done;
     worker.thread = std::thread([this, session_ptr, remote_endpoint, done]() {
         const int active = active_sessions_.fetch_add(1) + 1;
-        LOG << "client connected: " << remote_endpoint << ", active sessions: " << active;
+        session_ptr->log() << "client connected: " << remote_endpoint << ", active sessions: " << active;
         session_ptr->run();
         const int after = active_sessions_.fetch_sub(1) - 1;
-        LOG << "client disconnected: " << remote_endpoint << ", active sessions: " << after;
+        session_ptr->log() << "client disconnected: " << remote_endpoint << ", active sessions: " << after;
         done->store(true, std::memory_order_release);
         sessions_cv_.notify_one();
     });

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "logger.h"
 #include "media_tools.h"
 
 #include <filesystem>
@@ -12,14 +13,15 @@
 
 class Session {
 public:
-    Session(int client_fd, const std::string& remote_endpoint, const std::filesystem::path& media_dir):
-        client_fd_(client_fd), remote_endpoint_(remote_endpoint), media_dir_(media_dir) {}
+    Session(int client_fd, const std::string& remote_endpoint, const std::filesystem::path& media_dir, std::uint32_t session_id);
 
     ~Session();
 
     void run();
     void shutdown();
     const std::string& remote_endpoint() const;
+    std::uint32_t session_id() const;
+    Logger::Entry log() const;
 
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
@@ -44,12 +46,14 @@ private:
     bool start_streaming();
     void stop_streaming();
     bool handle_request(const std::string& raw_request, bool& should_close);
-    static std::string make_session_id();
+    std::string log_prefix() const;
+    std::string session_id_text() const;
+    bool has_setup_tracks() const;
 
     int client_fd_;
     std::string remote_endpoint_;
     std::filesystem::path media_dir_;
-    std::string session_id_;
+    std::uint32_t session_id_;
     std::string current_media_uri_;
     TrackPorts video_ports_ {0, 0, 50000, 50001, false};
     TrackPorts audio_ports_ {0, 0, 50002, 50003, false};
