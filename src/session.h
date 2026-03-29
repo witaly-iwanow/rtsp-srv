@@ -1,5 +1,7 @@
 #pragma once
 
+#include "media_tools.h"
+
 #include <filesystem>
 #include <cstdint>
 #include <mutex>
@@ -38,6 +40,7 @@ private:
         const std::string& cseq,
         const std::vector<std::pair<std::string, std::string>>& headers,
         const std::string& body);
+    bool load_media_description(const std::filesystem::path& media_path, const std::string& media_uri);
     bool start_streaming();
     void stop_streaming();
     bool handle_request(const std::string& raw_request, bool& should_close);
@@ -51,6 +54,7 @@ private:
     TrackPorts video_ports_ {0, 0, 50000, 50001, false};
     TrackPorts audio_ports_ {0, 0, 50002, 50003, false};
     std::filesystem::path current_media_path_;
+    MediaDescription current_media_;
     pid_t ffmpeg_pid_ = -1;
     mutable std::mutex stream_mutex_;
     mutable std::mutex fd_mutex_;

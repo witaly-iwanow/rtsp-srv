@@ -18,6 +18,7 @@ find_package(Threads REQUIRED)
 
 add_executable(rtsp_server
     src/main.cpp
+    src/media_tools.cpp
     src/rtsp_server.cpp
     src/session.cpp
 )
