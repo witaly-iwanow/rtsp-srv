@@ -27,6 +27,20 @@ std::string trim(const std::string& value) {
     return value.substr(first, last - first + 1);
 }
 
+bool parse_int_value(const std::string& value, int& parsed) {
+    if (value.empty())
+        return false;
+    try {
+        const int candidate = std::stoi(value);
+        if (std::to_string(candidate) != value)
+            return false;
+        parsed = candidate;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool is_passthrough_video_codec(const std::string& codec_name) {
     return codec_name == "hevc" || codec_name == "h264" || codec_name == "mpeg2video" || codec_name == "vp8"
         || codec_name == "vp9";
@@ -182,10 +196,14 @@ bool probe_track(const std::filesystem::path& media_path, const char* selector, 
         if (key == "codec_name") {
             track.codec_name = to_lower(value);
             track.present = !track.codec_name.empty();
-        } else if (key == "channels" && !value.empty()) {
-            track.channels = std::stoi(value);
-        } else if (key == "sample_rate" && !value.empty()) {
-            track.sample_rate = std::stoi(value);
+        } else if (key == "channels") {
+            int channels = 0;
+            if (parse_int_value(value, channels))
+                track.channels = channels;
+        } else if (key == "sample_rate") {
+            int sample_rate = 0;
+            if (parse_int_value(value, sample_rate))
+                track.sample_rate = sample_rate;
         }
     }
 

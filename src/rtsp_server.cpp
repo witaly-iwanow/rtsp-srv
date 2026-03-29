@@ -88,6 +88,14 @@ bool is_supported_extension(const std::filesystem::path& path) {
     return false;
 }
 
+bool is_wildcard_host(const std::string& host) {
+    return host == "0.0.0.0" || host == "::";
+}
+
+bool is_loopback_host(const std::string& host) {
+    return host == "127.0.0.1" || host == "::1" || to_lower(host) == "localhost";
+}
+
 std::size_t find_media_files(const std::filesystem::path& media_dir) {
     std::size_t count = 0;
     for (const auto& entry: std::filesystem::directory_iterator(media_dir)) {
@@ -118,11 +126,15 @@ int open_listener(const std::string& host, std::uint16_t port) {
     addrinfo hints {};
     hints.ai_family = (host == "::" ? AF_INET6 : (host == "0.0.0.0" ? AF_INET : AF_UNSPEC));
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    hints.ai_flags = is_wildcard_host(host) ? AI_PASSIVE : 0;
+
+    if (is_loopback_host(host))
+        LOG << "Binding to loopback only (" << host << "). Remote clients will not connect; feel free to shoot yourself in the foot.";
 
     ListenerGuard listener;
     const auto service = std::to_string(port);
-    const int rv = getaddrinfo(nullptr, service.c_str(), &hints, &listener.ai);
+    const char* node = is_wildcard_host(host) ? nullptr : host.c_str();
+    const int rv = getaddrinfo(node, service.c_str(), &hints, &listener.ai);
     if (rv != 0 || !listener.ai) {
         LOG << "getaddrinfo for " << host << ":" << service << " failed with " << gai_strerror(rv);
         return -1;
