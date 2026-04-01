@@ -15,7 +15,11 @@ endif()
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
 find_path(ASIO_INCLUDE_DIR NAMES asio.hpp REQUIRED)
+pkg_check_modules(LIBAVFORMAT REQUIRED IMPORTED_TARGET libavformat)
+pkg_check_modules(LIBAVCODEC REQUIRED IMPORTED_TARGET libavcodec)
+pkg_check_modules(LIBAVUTIL REQUIRED IMPORTED_TARGET libavutil)
 
 add_library(asio INTERFACE)
 target_include_directories(asio SYSTEM INTERFACE "${ASIO_INCLUDE_DIR}")
@@ -30,4 +34,12 @@ add_executable(rtsp_server
 )
 
 target_include_directories(rtsp_server PRIVATE src)
-target_link_libraries(rtsp_server PRIVATE asio Threads::Threads)
+target_link_libraries(
+    rtsp_server
+    PRIVATE
+        asio
+        Threads::Threads
+        PkgConfig::LIBAVFORMAT
+        PkgConfig::LIBAVCODEC
+        PkgConfig::LIBAVUTIL
+)

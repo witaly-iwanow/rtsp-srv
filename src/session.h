@@ -6,13 +6,12 @@
 #include "media_tools.h"
 
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
-#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
-#include <sys/types.h>
 #include <utility>
 #include <vector>
 
@@ -41,22 +40,6 @@ public:
     Session& operator=(const Session&) = delete;
 
 private:
-    class ChildProcess {
-    public:
-        ChildProcess() = default;
-        ~ChildProcess();
-
-        ChildProcess(const ChildProcess&) = delete;
-        ChildProcess& operator=(const ChildProcess&) = delete;
-
-        bool running() const;
-        pid_t release();
-        void reset(pid_t pid = -1);
-
-    private:
-        pid_t pid_ = -1;
-    };
-
     struct TrackPorts {
         std::uint16_t client_rtp = 0;
         std::uint16_t client_rtcp = 0;
@@ -109,11 +92,11 @@ private:
     std::uint32_t session_id_;
     CloseHandler on_close_;
     std::string current_media_uri_;
-    TrackPorts video_ports_ {0, 0, 50000, 50001, false};
-    TrackPorts audio_ports_ {0, 0, 50002, 50003, false};
+    TrackPorts video_ports_;
+    TrackPorts audio_ports_;
     std::filesystem::path current_media_path_;
     MediaDescription current_media_;
-    ChildProcess ffmpeg_process_;
+    std::unique_ptr<MediaStreamer> streamer_;
     std::array<char, 4096> read_buffer_ {};
     std::string pending_requests_;
     std::deque<std::string> write_queue_;

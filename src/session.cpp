@@ -2,21 +2,13 @@
 #include "logger.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <chrono>
-#include <csignal>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unordered_map>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 
 namespace {
 
@@ -27,11 +19,6 @@ struct RtspRequest {
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 };
-
-constexpr std::uint16_t kDescribeVideoRtpPort = 40000;
-constexpr std::uint16_t kDescribeAudioRtpPort = 40002;
-
-std::string make_rtp_url(const std::string& host, std::uint16_t port);
 
 int video_track_id(const MediaDescription& media) {
     return media.video.present ? 0 : -1;
@@ -57,6 +44,14 @@ bool track_id_is_audio(const MediaDescription& media, int track_id) {
 
 std::string make_rtp_cname(std::uint32_t session_id) {
     return "rtsp-srv-" + std::to_string(session_id);
+}
+
+std::pair<std::uint16_t, std::uint16_t> make_server_ports(std::uint32_t session_id, std::uint16_t base_port) {
+    constexpr std::uint16_t kPortSpan = 15000;
+    constexpr std::uint16_t kPortsPerSession = 4;
+    const std::uint16_t offset = static_cast<std::uint16_t>(((session_id - 1) * kPortsPerSession) % kPortSpan);
+    const std::uint16_t rtp = static_cast<std::uint16_t>(base_port + offset);
+    return {rtp, static_cast<std::uint16_t>(rtp + 1)};
 }
 
 std::string to_lower(std::string value) {
@@ -257,122 +252,6 @@ bool parse_media_relative_path(const std::string& uri, std::filesystem::path& re
     return !relative_path.empty();
 }
 
-std::string normalize_sdp(const std::string& raw_sdp, const std::string& media_name) {
-    std::istringstream iss(raw_sdp);
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            lines.push_back(line);
-    }
-
-    std::vector<std::string> normalized;
-    normalized.reserve(lines.size() + 4);
-    bool has_session_control = false;
-    bool has_time = false;
-    int track_id = -1;
-    for (const std::string& original: lines) {
-        if (original.rfind("a=control:", 0) == 0)
-            continue;
-
-        std::string current = original;
-        if (current.rfind("s=", 0) == 0)
-            current = "s=" + media_name;
-        else if (current.rfind("c=", 0) == 0)
-            current = "c=IN IP4 0.0.0.0";
-        else if (current.rfind("m=", 0) == 0) {
-            if (track_id >= 0)
-                normalized.emplace_back("a=control:trackID=" + std::to_string(track_id));
-            ++track_id;
-
-            std::istringstream media_line(current);
-            std::string prefix;
-            std::string media_type;
-            std::string port;
-            std::string proto;
-            if ((media_line >> prefix >> port >> proto))
-                current = prefix + " 0 " + proto + current.substr(prefix.size() + 1 + port.size() + 1 + proto.size());
-        } else if (current.rfind("t=", 0) == 0) {
-            has_time = true;
-        }
-
-        normalized.push_back(current);
-        if (current.rfind("t=", 0) == 0 && !has_session_control) {
-            normalized.emplace_back("a=control:*");
-            has_session_control = true;
-        }
-    }
-
-    if (!has_time) {
-        normalized.emplace_back("t=0 0");
-        normalized.emplace_back("a=control:*");
-        has_session_control = true;
-    }
-    if (!has_session_control)
-        normalized.emplace_back("a=control:*");
-    if (track_id >= 0)
-        normalized.emplace_back("a=control:trackID=" + std::to_string(track_id));
-
-    std::ostringstream sdp;
-    for (const std::string& normalized_line: normalized)
-        sdp << normalized_line << "\r\n";
-    return sdp.str();
-}
-
-bool generate_sdp(const std::filesystem::path& media_path, const MediaDescription& media, std::string& sdp_out) {
-    char temp_path[] = "/tmp/rtsp-sdp-XXXXXX";
-    const int temp_fd = mkstemp(temp_path);
-    if (temp_fd < 0) {
-        LOG << "mkstemp() failed: " << std::strerror(errno);
-        return false;
-    }
-    close(temp_fd);
-
-    const std::string sdp_file = temp_path;
-    const std::string video_rtp_url = make_rtp_url("127.0.0.1", kDescribeVideoRtpPort);
-    const std::string audio_rtp_url = make_rtp_url("127.0.0.1", kDescribeAudioRtpPort);
-    const std::string* video_url = media.video.present ? &video_rtp_url : nullptr;
-    const std::string* audio_url = media.audio.present ? &audio_rtp_url : nullptr;
-    const std::string rtp_cname = "rtsp-sdp";
-    const std::vector<std::string> args =
-        make_ffmpeg_args(media_path, media, video_url, audio_url, &rtp_cname, false, false, &sdp_file);
-
-    LOG << "Generating SDP via ffmpeg: " << join_command(args);
-    const pid_t pid = spawn_process(args);
-    if (pid < 0) {
-        LOG << "fork() failed for ffmpeg SDP generation: " << std::strerror(errno);
-        unlink(temp_path);
-        return false;
-    }
-
-    std::string raw_sdp;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!std::filesystem::exists(sdp_file))
-            continue;
-        if (std::filesystem::file_size(sdp_file) == 0)
-            continue;
-
-        std::ifstream input(sdp_file);
-        raw_sdp.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-        if (!raw_sdp.empty())
-            break;
-    }
-
-    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
-        LOG << "kill(SIGTERM) failed for ffmpeg SDP pid " << pid << ": " << std::strerror(errno);
-    wait_for_process(pid, "ffmpeg", false);
-    unlink(temp_path);
-
-    if (raw_sdp.empty())
-        return false;
-
-    sdp_out = normalize_sdp(raw_sdp, media_path.filename().string());
-    return true;
-}
-
 std::string cseq_or_zero(const std::string& cseq) {
     if (cseq.empty())
         return "0";
@@ -401,37 +280,7 @@ std::string endpoint_host(const std::string& endpoint) {
     return endpoint.substr(0, colon);
 }
 
-std::string make_rtp_url(const std::string& host, std::uint16_t port) {
-    if (host.find(':') != std::string::npos)
-        return "rtp://[" + host + "]:" + std::to_string(port) + "?pkt_size=1200";
-    return "rtp://" + host + ":" + std::to_string(port) + "?pkt_size=1200";
-}
-
 }  // namespace
-
-Session::ChildProcess::~ChildProcess() {
-    const pid_t pid = release();
-    if (pid <= 0)
-        return;
-
-    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
-        LOG << "kill(SIGTERM) failed for child pid " << pid << ": " << std::strerror(errno);
-    static_cast<void>(wait_for_process(pid, "child process", false));
-}
-
-bool Session::ChildProcess::running() const {
-    return pid_ > 0;
-}
-
-pid_t Session::ChildProcess::release() {
-    const pid_t pid = pid_;
-    pid_ = -1;
-    return pid;
-}
-
-void Session::ChildProcess::reset(pid_t pid) {
-    pid_ = pid;
-}
 
 Session::Session(
     Socket socket,
@@ -443,7 +292,15 @@ Session::Session(
     remote_endpoint_(std::move(remote_endpoint)),
     media_dir_(media_dir),
     session_id_(session_id),
-    on_close_(std::move(on_close)) {}
+    on_close_(std::move(on_close)) {
+    const auto [video_rtp, video_rtcp] = make_server_ports(session_id_, 50000);
+    video_ports_.server_rtp = video_rtp;
+    video_ports_.server_rtcp = video_rtcp;
+
+    const auto [audio_rtp, audio_rtcp] = make_server_ports(session_id_, 50002);
+    audio_ports_.server_rtp = audio_rtp;
+    audio_ports_.server_rtcp = audio_rtcp;
+}
 
 Session::~Session() {
     stop_streaming();
@@ -627,13 +484,7 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
         return true;
 
     MediaDescription media;
-    if (!probe_track(media_path, "v:0", true, media.video))
-        return false;
-    if (!probe_track(media_path, "a:0", false, media.audio))
-        return false;
-    if (!media.video.present && !media.audio.present)
-        return false;
-    if (!generate_sdp(media_path, media, media.sdp))
+    if (!describe_media(media_path, media))
         return false;
 
     current_media_path_ = media_path;
@@ -657,7 +508,7 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
 }
 
 bool Session::start_streaming() {
-    if (ffmpeg_process_.running())
+    if (streamer_ && streamer_->running())
         return true;
     if (current_media_path_.empty() || current_media_.sdp.empty())
         return false;
@@ -671,38 +522,45 @@ bool Session::start_streaming() {
     if (!stream_video && !stream_audio)
         return false;
 
-    std::string video_rtp_url;
-    if (stream_video)
-        video_rtp_url = make_rtp_url(host, video_ports_.client_rtp);
-    std::string audio_rtp_url;
-    if (stream_audio)
-        audio_rtp_url = make_rtp_url(host, audio_ports_.client_rtp);
-
-    const std::string* video_url = stream_video ? &video_rtp_url : nullptr;
-    const std::string* audio_url = stream_audio ? &audio_rtp_url : nullptr;
-    const std::string rtp_cname = make_rtp_cname(session_id_);
-    const std::vector<std::string> args =
-        make_ffmpeg_args(current_media_path_, current_media_, video_url, audio_url, &rtp_cname, true, true);
-    log() << "starting ffmpeg: " << join_command(args);
-
-    const pid_t pid = spawn_process(args);
-    if (pid < 0) {
-        log() << "fork() failed for ffmpeg: " << std::strerror(errno);
-        return false;
+    StreamTarget video_target;
+    if (stream_video) {
+        video_target.enabled = true;
+        video_target.host = host;
+        video_target.client_rtp = video_ports_.client_rtp;
+        video_target.client_rtcp = video_ports_.client_rtcp;
+        video_target.server_rtp = video_ports_.server_rtp;
+        video_target.server_rtcp = video_ports_.server_rtcp;
     }
 
-    ffmpeg_process_.reset(pid);
+    StreamTarget audio_target;
+    if (stream_audio) {
+        audio_target.enabled = true;
+        audio_target.host = host;
+        audio_target.client_rtp = audio_ports_.client_rtp;
+        audio_target.client_rtcp = audio_ports_.client_rtcp;
+        audio_target.server_rtp = audio_ports_.server_rtp;
+        audio_target.server_rtcp = audio_ports_.server_rtcp;
+    }
+
+    auto streamer = std::make_unique<MediaStreamer>(
+        current_media_path_,
+        current_media_,
+        video_target,
+        audio_target,
+        make_rtp_cname(session_id_),
+        log_prefix());
+    if (!streamer->start())
+        return false;
+
+    streamer_ = std::move(streamer);
     return true;
 }
 
 void Session::stop_streaming() {
-    const pid_t pid = ffmpeg_process_.release();
-    if (pid <= 0)
+    if (!streamer_)
         return;
-
-    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
-        log() << "kill(SIGTERM) failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
-    wait_for_process(pid, log_prefix() + " ffmpeg");
+    streamer_->stop();
+    streamer_.reset();
 }
 
 Session::RequestOutcome Session::handle_options(const std::string& cseq) const {

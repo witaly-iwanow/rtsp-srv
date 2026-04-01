@@ -1,8 +1,13 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
-#include <sys/types.h>
+#include <thread>
 #include <vector>
 
 struct MediaTrack {
@@ -10,6 +15,7 @@ struct MediaTrack {
     bool copy = false;
     int channels = 0;
     int sample_rate = 0;
+    int stream_index = -1;
     std::string codec_name;
 };
 
@@ -19,16 +25,52 @@ struct MediaDescription {
     std::string sdp;
 };
 
-std::string join_command(const std::vector<std::string>& args);
-pid_t spawn_process(const std::vector<std::string>& args, int stdout_fd = -1, int stderr_fd = -1);
-bool wait_for_process(pid_t pid, const std::string& process_name, bool log_exit = true);
-bool probe_track(const std::filesystem::path& media_path, const char* selector, bool is_video, MediaTrack& track);
-std::vector<std::string> make_ffmpeg_args(
-    const std::filesystem::path& media_path,
-    const MediaDescription& media,
-    const std::string* video_rtp_url,
-    const std::string* audio_rtp_url,
-    const std::string* rtp_cname,
-    bool realtime,
-    bool loop_input,
-    const std::string* sdp_file = nullptr);
+struct StreamTarget {
+    bool enabled = false;
+    std::string host;
+    std::uint16_t client_rtp = 0;
+    std::uint16_t client_rtcp = 0;
+    std::uint16_t server_rtp = 0;
+    std::uint16_t server_rtcp = 0;
+};
+
+bool describe_media(const std::filesystem::path& media_path, MediaDescription& media);
+
+class MediaStreamer {
+public:
+    MediaStreamer(
+        std::filesystem::path media_path,
+        MediaDescription media,
+        StreamTarget video_target,
+        StreamTarget audio_target,
+        std::string rtp_cname,
+        std::string log_prefix);
+
+    ~MediaStreamer();
+
+    MediaStreamer(const MediaStreamer&) = delete;
+    MediaStreamer& operator=(const MediaStreamer&) = delete;
+
+    bool start();
+    void stop();
+    bool running() const;
+
+private:
+    void run();
+    void report_startup_result(bool ok, std::string error_text = {});
+
+    std::filesystem::path media_path_;
+    MediaDescription media_;
+    StreamTarget video_target_;
+    StreamTarget audio_target_;
+    std::string rtp_cname_;
+    std::string log_prefix_;
+    std::thread worker_;
+    std::atomic<bool> stop_requested_ {false};
+    std::atomic<bool> running_ {false};
+    std::mutex state_mutex_;
+    std::condition_variable state_cv_;
+    bool startup_done_ = false;
+    bool startup_ok_ = false;
+    std::string startup_error_;
+};

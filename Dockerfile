@@ -7,7 +7,9 @@ RUN apt-get update \
         build-essential \
         clang \
         cmake \
-        ffmpeg \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
         libasio-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -26,7 +28,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /media
