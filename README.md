@@ -1,9 +1,11 @@
 # Demo RTSP Server
 
-A C++ RTSP server for serving local media files over RTP. Start it with a media directory and a bind address, then open `rtsp://host:port/<filename>` in a client such as `ffplay` or VLC. The server implements the RTSP control plane itself and streams the requested file in a loop. The number of clients connected simultaneously is not limited - just wait for it to run out of RAM/CPU. The server supports video-only, audio-only, and audio+video inputs. In practice it can handle whatever the local `ffprobe`/`ffmpeg` build can demux and process; the current limitation is that file discovery is gated by a small extension whitelist in [src/rtsp_server.cpp](/home/vitaly/tmp/rtsp-srv/git/src/rtsp_server.cpp#L24), feel free to edit it.
+A simple RTSP server for serving local media files over RTP, based on `Asio` for async I/O and networking, and `libavformat`, `libavcodec`, and `libavutil` for transmuxing and transcoding. The server implements the RTSP control logic and streams requested files in a loop, and can serve multiple clients simultaneously.
 
-The server handles `OPTIONS`, `DESCRIBE`, `SETUP`, and `PLAY`, generates SDP using `ffmpeg`, and on `PLAY` launches `ffmpeg` to send RTP directly to the client ports negotiated during `SETUP`.
-Supported RTSP transport: UDP unicast RTP/RTCP with `client_port=` negotiation. Interleaved RTP over RTSP/TCP is not implemented (FFmpeg's RTP mux limitation).
+The server supports video-only, audio-only, and audio+video inputs. In practice it can handle any format FFmpeg supports; the current implementation, however, whitelists only certain extensions in [src/rtsp_server.cpp](https://github.com/witaly-iwanow/rtsp-srv/blob/a82538393bdea4de1c4a7d18804ba64106a851ed/src/rtsp_server.cpp#L19), feel free to edit it.
+
+The server handles `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, and `TEARDOWN`. SDP is generated in-process from RTP muxer contexts, and on `PLAY` the server opens the requested file itself and writes RTP packets directly to the client ports negotiated during `SETUP`.
+Supported RTSP transport: UDP unicast RTP/RTCP with `client_port=` negotiation. Interleaved RTP over RTSP/TCP is not implemented.
 
 Video codecs: HEVC, AVC, VP8, VP9 and MPEG-2 are sent as-is; other video codecs are transcoded to AVC as a precaution. AV1 can be added to the list with FFmpeg 7.1 or later, just add `-bsf:v av1_frame_split -strict experimental` for this case.
 Audio codecs: Opus, AAC and MPEG Audio Layers 1/2/3 are sent as-is; other audio codecs are transcoded to Opus.
