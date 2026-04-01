@@ -15,6 +15,12 @@ endif()
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 find_package(Threads REQUIRED)
+find_path(ASIO_INCLUDE_DIR NAMES asio.hpp REQUIRED)
+
+add_library(asio INTERFACE)
+target_include_directories(asio SYSTEM INTERFACE "${ASIO_INCLUDE_DIR}")
+target_compile_definitions(asio INTERFACE ASIO_STANDALONE)
+target_link_libraries(asio INTERFACE Threads::Threads)
 
 add_executable(rtsp_server
     src/main.cpp
@@ -24,4 +30,4 @@ add_executable(rtsp_server
 )
 
 target_include_directories(rtsp_server PRIVATE src)
-target_link_libraries(rtsp_server PRIVATE Threads::Threads)
+target_link_libraries(rtsp_server PRIVATE asio Threads::Threads)

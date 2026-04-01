@@ -8,6 +8,7 @@ RUN apt-get update \
         clang \
         cmake \
         ffmpeg \
+        libasio-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

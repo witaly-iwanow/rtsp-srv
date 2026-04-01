@@ -6,34 +6,17 @@
 #include "rtsp_server.h"
 
 struct ServerConfig {
-    std::filesystem::path media_dir;
-    std::string host;
-    std::uint16_t port;
+    std::filesystem::path media_dir = std::filesystem::current_path();
+    std::string host = "0.0.0.0";
+    std::string service = "554";
 };
-
-std::uint16_t parse_port(const std::string& port_text) {
-    int parsed_port = 0;
-    try {
-        parsed_port = std::stoi(port_text);
-    } catch (const std::exception&) {
-        throw std::invalid_argument("port must be numeric");
-    }
-
-    if (std::to_string(parsed_port) != port_text)
-        throw std::invalid_argument("port must be numeric");
-
-    if (parsed_port <= 0 || parsed_port > 65535)
-        throw std::out_of_range("port must be in range 1..65535");
-
-    return static_cast<std::uint16_t>(parsed_port);
-}
 
 void parse_bind(ServerConfig& cfg, const std::string& bind) {
     if (bind.empty())
         throw std::invalid_argument("bind must not be empty");
 
     if (bind.find(':') == std::string::npos) {
-        cfg.port = parse_port(bind);
+        cfg.service = bind;
         return;
     }
 
@@ -44,7 +27,7 @@ void parse_bind(ServerConfig& cfg, const std::string& bind) {
         cfg.host = bind.substr(1, closing - 1);
         if (cfg.host.empty())
             throw std::invalid_argument("host must not be empty");
-        cfg.port = parse_port(bind.substr(closing + 2));
+        cfg.service = bind.substr(closing + 2);
         return;
     }
 
@@ -54,14 +37,11 @@ void parse_bind(ServerConfig& cfg, const std::string& bind) {
     cfg.host = bind.substr(0, sep);
     if (cfg.host.empty())
         throw std::invalid_argument("host must not be empty");
-    cfg.port = parse_port(bind.substr(sep + 1));
+    cfg.service = bind.substr(sep + 1);
 }
 
 ServerConfig parse_config(int argc, char** argv) {
     ServerConfig cfg;
-    cfg.media_dir = std::filesystem::current_path();
-    cfg.host = "0.0.0.0";
-    cfg.port = 554;
 
     if (argc > 1)
         cfg.media_dir = argv[1];
@@ -87,7 +67,7 @@ void print_usage(const char* exe_name) {
 int main(int argc, char** argv) {
     try {
         const ServerConfig cfg = parse_config(argc, argv);
-        RtspServer server(cfg.media_dir, cfg.host, cfg.port);
+        RtspServer server(cfg.media_dir, cfg.host, cfg.service);
         return server.run();
     } catch (const std::exception& ex) {
         print_usage(argv[0]);

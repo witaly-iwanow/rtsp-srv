@@ -3,19 +3,20 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cctype>
 #include <chrono>
+#include <csignal>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <signal.h>
 #include <sstream>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 namespace {
 
@@ -408,43 +409,62 @@ std::string make_rtp_url(const std::string& host, std::uint16_t port) {
 
 }  // namespace
 
+Session::ChildProcess::~ChildProcess() {
+    const pid_t pid = release();
+    if (pid <= 0)
+        return;
+
+    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
+        LOG << "kill(SIGTERM) failed for child pid " << pid << ": " << std::strerror(errno);
+    static_cast<void>(wait_for_process(pid, "child process", false));
+}
+
+bool Session::ChildProcess::running() const {
+    return pid_ > 0;
+}
+
+pid_t Session::ChildProcess::release() {
+    const pid_t pid = pid_;
+    pid_ = -1;
+    return pid;
+}
+
+void Session::ChildProcess::reset(pid_t pid) {
+    pid_ = pid;
+}
+
 Session::Session(
-    int client_fd,
-    const std::string& remote_endpoint,
+    Socket socket,
+    std::string remote_endpoint,
     const std::filesystem::path& media_dir,
-    std::uint32_t session_id):
-    client_fd_(client_fd), remote_endpoint_(remote_endpoint), media_dir_(media_dir), session_id_(session_id) {}
+    std::uint32_t session_id,
+    CloseHandler on_close):
+    socket_(std::move(socket)),
+    remote_endpoint_(std::move(remote_endpoint)),
+    media_dir_(media_dir),
+    session_id_(session_id),
+    on_close_(std::move(on_close)) {}
 
 Session::~Session() {
     stop_streaming();
+}
 
-    const std::lock_guard<std::mutex> lock(fd_mutex_);
-    if (client_fd_ >= 0) {
-        close(client_fd_);
-        client_fd_ = -1;
-    }
+void Session::start() {
+    start_read();
 }
 
 void Session::shutdown() {
-    stop_streaming();
-
-    const std::lock_guard<std::mutex> lock(fd_mutex_);
-    if (client_fd_ < 0)
+    if (finished_)
         return;
 
-    constexpr char kShutdownMsg[] =
-        "RTSP/1.0 503 Service Unavailable\r\n"
-        "CSeq: 0\r\n"
-        "Connection: close\r\n"
-        "Reason: server shutting down\r\n"
-        "\r\n";
-
-    int send_flags = 0;
-#ifdef MSG_NOSIGNAL
-    send_flags = MSG_NOSIGNAL;
-#endif
-    static_cast<void>(send(client_fd_, kShutdownMsg, sizeof(kShutdownMsg) - 1, send_flags));
-    ::shutdown(client_fd_, SHUT_RDWR);
+    stop_streaming();
+    queue_response(make_response(
+        503,
+        "Service Unavailable",
+        "0",
+        {{"Connection", "close"}, {"Reason", "server shutting down"}},
+        "",
+        true));
 }
 
 const std::string& Session::remote_endpoint() const {
@@ -473,33 +493,19 @@ bool Session::has_setup_tracks() const {
     return video_ports_.setup || audio_ports_.setup;
 }
 
-bool Session::send_raw(const std::string& data) {
-    const std::lock_guard<std::mutex> lock(fd_mutex_);
-    if (client_fd_ < 0)
-        return false;
-
-    std::size_t sent = 0;
-    int send_flags = 0;
-#ifdef MSG_NOSIGNAL
-    send_flags = MSG_NOSIGNAL;
-#endif
-    while (sent < data.size()) {
-        const ssize_t n = send(client_fd_, data.data() + sent, data.size() - sent, send_flags);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return false;
-        sent += static_cast<std::size_t>(n);
-    }
-    return true;
+void Session::reset_track_state() {
+    video_ports_.setup = false;
+    audio_ports_.setup = false;
+    current_media_ = {};
 }
 
-bool Session::send_response(
+Session::RequestOutcome Session::make_response(
     int status_code,
     const std::string& reason,
     const std::string& cseq,
     const std::vector<std::pair<std::string, std::string>>& headers,
-    const std::string& body) {
+    const std::string& body,
+    bool close_after_response) const {
     std::ostringstream response;
     response << "RTSP/1.0 " << status_code << ' ' << reason << "\r\n";
     response << "CSeq: " << cseq_or_zero(cseq) << "\r\n";
@@ -509,7 +515,111 @@ bool Session::send_response(
         response << "Content-Length: " << body.size() << "\r\n";
     response << "\r\n";
     response << body;
-    return send_raw(response.str());
+    return {response.str(), close_after_response};
+}
+
+void Session::start_read() {
+    auto self = shared_from_this();
+    socket_.async_read_some(asio::buffer(read_buffer_), [self](asio::error_code ec, std::size_t bytes_read) {
+        self->handle_read(ec, bytes_read);
+    });
+}
+
+void Session::handle_read(asio::error_code ec, std::size_t bytes_read) {
+    if (finished_)
+        return;
+    if (ec) {
+        if (ec != asio::error::eof && ec != asio::error::operation_aborted)
+            log() << "read failed from " << remote_endpoint_ << ": " << ec.message();
+        finish();
+        return;
+    }
+
+    pending_requests_.append(read_buffer_.data(), bytes_read);
+    process_pending_requests();
+    if (!finished_)
+        start_read();
+}
+
+void Session::process_pending_requests() {
+    while (!finished_) {
+        std::string request;
+        if (!extract_next_rtsp_request(pending_requests_, request))
+            return;
+
+        RequestOutcome outcome = handle_request(request);
+        const bool close_after_response = outcome.close_after_response;
+        queue_response(std::move(outcome));
+        if (close_after_response)
+            return;
+    }
+}
+
+void Session::queue_response(RequestOutcome outcome) {
+    if (finished_)
+        return;
+
+    close_after_write_ = close_after_write_ || outcome.close_after_response;
+    const bool write_idle = write_queue_.empty();
+    write_queue_.push_back(std::move(outcome.response));
+    if (write_idle)
+        start_write();
+}
+
+void Session::start_write() {
+    if (finished_ || write_queue_.empty())
+        return;
+
+    auto self = shared_from_this();
+    asio::async_write(socket_, asio::buffer(write_queue_.front()), [self](asio::error_code ec, std::size_t bytes_written) {
+        self->handle_write(ec, bytes_written);
+    });
+}
+
+void Session::handle_write(asio::error_code ec, std::size_t) {
+    if (finished_)
+        return;
+    if (ec) {
+        if (ec != asio::error::operation_aborted)
+            log() << "write failed to " << remote_endpoint_ << ": " << ec.message();
+        finish();
+        return;
+    }
+
+    if (!write_queue_.empty())
+        write_queue_.pop_front();
+    if (!write_queue_.empty()) {
+        start_write();
+        return;
+    }
+
+    if (close_after_write_)
+        finish();
+}
+
+void Session::close_socket() {
+    if (!socket_.is_open())
+        return;
+
+    asio::error_code ec;
+    socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+    socket_.close(ec);
+}
+
+void Session::finish() {
+    if (finished_)
+        return;
+
+    finished_ = true;
+    close_after_write_ = true;
+    pending_requests_.clear();
+    write_queue_.clear();
+    close_socket();
+    stop_streaming();
+
+    CloseHandler on_close = std::move(on_close_);
+    if (on_close)
+        on_close(session_id_, remote_endpoint_);
 }
 
 bool Session::load_media_description(const std::filesystem::path& media_path, const std::string& media_uri) {
@@ -532,13 +642,13 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
 
     if (current_media_.video.present) {
         log() << "selected video codec " << current_media_.video.codec_name
-            << (current_media_.video.copy ? " via passthrough" : " via libx264 transcode");
+              << (current_media_.video.copy ? " via passthrough" : " via libx264 transcode");
     } else {
         log() << "no video track detected";
     }
     if (current_media_.audio.present) {
         log() << "selected audio codec " << current_media_.audio.codec_name
-            << (current_media_.audio.copy ? " via passthrough" : " via libopus transcode");
+              << (current_media_.audio.copy ? " via passthrough" : " via libopus transcode");
     } else {
         log() << "no audio track detected";
     }
@@ -547,8 +657,7 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
 }
 
 bool Session::start_streaming() {
-    const std::lock_guard<std::mutex> lock(stream_mutex_);
-    if (ffmpeg_pid_ > 0)
+    if (ffmpeg_process_.running())
         return true;
     if (current_media_path_.empty() || current_media_.sdp.empty())
         return false;
@@ -582,192 +691,161 @@ bool Session::start_streaming() {
         return false;
     }
 
-    ffmpeg_pid_ = pid;
+    ffmpeg_process_.reset(pid);
     return true;
 }
 
 void Session::stop_streaming() {
-    pid_t pid = -1;
-    {
-        const std::lock_guard<std::mutex> lock(stream_mutex_);
-        if (ffmpeg_pid_ <= 0)
-            return;
-        pid = ffmpeg_pid_;
-        ffmpeg_pid_ = -1;
-    }
+    const pid_t pid = ffmpeg_process_.release();
+    if (pid <= 0)
+        return;
 
     if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
         log() << "kill(SIGTERM) failed for ffmpeg pid " << pid << ": " << std::strerror(errno);
-
     wait_for_process(pid, log_prefix() + " ffmpeg");
 }
 
-bool Session::handle_request(const std::string& raw_request, bool& should_close) {
+Session::RequestOutcome Session::handle_options(const std::string& cseq) const {
+    return make_response(200, "OK", cseq, {{"Public", "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"}}, "");
+}
+
+Session::RequestOutcome Session::handle_describe(const std::string& uri, const std::string& cseq) {
+    std::filesystem::path rel_path;
+    if (!parse_media_relative_path(uri, rel_path))
+        return make_response(400, "Bad Request", cseq, {}, "");
+
+    const auto media_path = media_dir_ / rel_path;
+    if (!std::filesystem::exists(media_path))
+        return make_response(404, "Not Found", cseq, {}, "");
+
+    const std::string media_uri = strip_track_suffix(uri);
+    if (!load_media_description(media_path, media_uri))
+        return make_response(415, "Unsupported Media Type", cseq, {}, "");
+
+    std::string base = current_media_uri_;
+    if (!base.empty() && base.back() != '/')
+        base += '/';
+    return make_response(
+        200,
+        "OK",
+        cseq,
+        {{"Content-Base", base}, {"Content-Type", "application/sdp"}},
+        current_media_.sdp);
+}
+
+Session::RequestOutcome Session::handle_setup(
+    const std::string& uri,
+    const std::string& cseq,
+    const std::string& transport,
+    const std::string& session_header) {
+    if (transport.empty())
+        return make_response(461, "Unsupported Transport", cseq, {}, "");
+
+    std::uint16_t parsed_rtp = 0;
+    std::uint16_t parsed_rtcp = 0;
+    if (!parse_client_ports(transport, parsed_rtp, parsed_rtcp))
+        return make_response(461, "Unsupported Transport", cseq, {}, "");
+
+    const std::string media_uri = strip_track_suffix(uri);
+    std::filesystem::path rel_path;
+    if (!parse_media_relative_path(media_uri, rel_path))
+        return make_response(400, "Bad Request", cseq, {}, "");
+
+    const auto media_path = media_dir_ / rel_path;
+    if (!std::filesystem::exists(media_path))
+        return make_response(404, "Not Found", cseq, {}, "");
+
+    int track_id = -1;
+    if (!parse_track_id(uri, track_id))
+        return make_response(400, "Bad Request", cseq, {}, "");
+
+    if (has_setup_tracks()) {
+        const std::string req_session = session_id_only(session_header);
+        if (!req_session.empty() && req_session != session_id_text())
+            return make_response(454, "Session Not Found", cseq, {}, "");
+    }
+
+    if (!current_media_path_.empty() && current_media_path_ != media_path) {
+        stop_streaming();
+        reset_track_state();
+    }
+
+    if (!load_media_description(media_path, media_uri))
+        return make_response(415, "Unsupported Media Type", cseq, {}, "");
+
+    if (!track_id_is_valid(current_media_, track_id))
+        return make_response(404, "Not Found", cseq, {}, "");
+
+    TrackPorts* ports = nullptr;
+    if (track_id_is_video(current_media_, track_id))
+        ports = &video_ports_;
+    else if (track_id_is_audio(current_media_, track_id))
+        ports = &audio_ports_;
+    else
+        return make_response(404, "Not Found", cseq, {}, "");
+
+    ports->client_rtp = parsed_rtp;
+    ports->client_rtcp = parsed_rtcp;
+    ports->setup = true;
+
+    std::ostringstream transport_reply;
+    transport_reply << "RTP/AVP;unicast;client_port=" << ports->client_rtp << '-' << ports->client_rtcp
+                    << ";server_port=" << ports->server_rtp << '-' << ports->server_rtcp;
+    return make_response(
+        200,
+        "OK",
+        cseq,
+        {{"Session", session_id_text()}, {"Transport", transport_reply.str()}},
+        "");
+}
+
+Session::RequestOutcome Session::handle_play(const std::string& cseq, const std::string& session_header) {
+    if (!has_setup_tracks())
+        return make_response(454, "Session Not Found", cseq, {}, "");
+
+    const std::string req_session = session_id_only(session_header);
+    if (!req_session.empty() && req_session != session_id_text())
+        return make_response(454, "Session Not Found", cseq, {}, "");
+
+    const bool can_play_video = current_media_.video.present && video_ports_.setup && video_ports_.client_rtp != 0;
+    const bool can_play_audio = current_media_.audio.present && audio_ports_.setup && audio_ports_.client_rtp != 0;
+    if (current_media_path_.empty() || (!can_play_video && !can_play_audio))
+        return make_response(455, "Method Not Valid In This State", cseq, {}, "");
+    if (!std::filesystem::exists(current_media_path_))
+        return make_response(404, "Not Found", cseq, {}, "");
+
+    if (!start_streaming())
+        return make_response(500, "Internal Server Error", cseq, {}, "");
+
+    return make_response(200, "OK", cseq, {{"Session", session_id_text()}}, "");
+}
+
+Session::RequestOutcome Session::handle_teardown(const std::string& cseq) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (has_setup_tracks())
+        headers.emplace_back("Session", session_id_text());
+    stop_streaming();
+    return make_response(200, "OK", cseq, headers, "", true);
+}
+
+Session::RequestOutcome Session::handle_request(const std::string& raw_request) {
     RtspRequest request;
     if (!parse_rtsp_request(raw_request, request))
-        return send_response(400, "Bad Request", "0", {}, "");
+        return make_response(400, "Bad Request", "0", {}, "");
 
     log() << request.method;
     const std::string cseq = get_header(request, "cseq");
 
     if (request.method == "OPTIONS")
-        return send_response(200, "OK", cseq, {{"Public", "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"}}, "");
+        return handle_options(cseq);
+    if (request.method == "DESCRIBE")
+        return handle_describe(request.uri, cseq);
+    if (request.method == "SETUP")
+        return handle_setup(request.uri, cseq, get_header(request, "transport"), get_header(request, "session"));
+    if (request.method == "PLAY")
+        return handle_play(cseq, get_header(request, "session"));
+    if (request.method == "TEARDOWN")
+        return handle_teardown(cseq);
 
-    if (request.method == "DESCRIBE") {
-        std::filesystem::path rel_path;
-        if (!parse_media_relative_path(request.uri, rel_path))
-            return send_response(400, "Bad Request", cseq, {}, "");
-
-        const auto media_path = media_dir_ / rel_path;
-        if (!std::filesystem::exists(media_path))
-            return send_response(404, "Not Found", cseq, {}, "");
-
-        const std::string media_uri = strip_track_suffix(request.uri);
-        if (!load_media_description(media_path, media_uri))
-            return send_response(415, "Unsupported Media Type", cseq, {}, "");
-
-        std::string base = current_media_uri_;
-        if (!base.empty() && base.back() != '/')
-            base += '/';
-        return send_response(
-            200,
-            "OK",
-            cseq,
-            {{"Content-Base", base}, {"Content-Type", "application/sdp"}},
-            current_media_.sdp);
-    }
-
-    if (request.method == "SETUP") {
-        const std::string transport = get_header(request, "transport");
-        if (transport.empty())
-            return send_response(461, "Unsupported Transport", cseq, {}, "");
-
-        std::uint16_t parsed_rtp = 0;
-        std::uint16_t parsed_rtcp = 0;
-        if (!parse_client_ports(transport, parsed_rtp, parsed_rtcp))
-            return send_response(461, "Unsupported Transport", cseq, {}, "");
-
-        const std::string media_uri = strip_track_suffix(request.uri);
-        std::filesystem::path rel_path;
-        if (!parse_media_relative_path(media_uri, rel_path))
-            return send_response(400, "Bad Request", cseq, {}, "");
-        const auto media_path = media_dir_ / rel_path;
-        if (!std::filesystem::exists(media_path))
-            return send_response(404, "Not Found", cseq, {}, "");
-
-        int track_id = -1;
-        if (!parse_track_id(request.uri, track_id))
-            return send_response(400, "Bad Request", cseq, {}, "");
-
-        if (has_setup_tracks()) {
-            const std::string req_session = session_id_only(get_header(request, "session"));
-            if (!req_session.empty() && req_session != session_id_text())
-                return send_response(454, "Session Not Found", cseq, {}, "");
-        }
-
-        if (!current_media_path_.empty() && current_media_path_ != media_path) {
-            stop_streaming();
-            video_ports_.setup = false;
-            audio_ports_.setup = false;
-            current_media_ = {};
-        }
-
-        if (!load_media_description(media_path, media_uri))
-            return send_response(415, "Unsupported Media Type", cseq, {}, "");
-
-        if (!track_id_is_valid(current_media_, track_id))
-            return send_response(404, "Not Found", cseq, {}, "");
-
-        TrackPorts* ports = nullptr;
-        if (track_id_is_video(current_media_, track_id))
-            ports = &video_ports_;
-        else if (track_id_is_audio(current_media_, track_id))
-            ports = &audio_ports_;
-        else
-            return send_response(404, "Not Found", cseq, {}, "");
-        ports->client_rtp = parsed_rtp;
-        ports->client_rtcp = parsed_rtcp;
-        ports->setup = true;
-
-        std::ostringstream transport_reply;
-        transport_reply << "RTP/AVP;unicast;client_port=" << ports->client_rtp << '-' << ports->client_rtcp
-                        << ";server_port=" << ports->server_rtp << '-' << ports->server_rtcp;
-        return send_response(
-            200,
-            "OK",
-            cseq,
-            {{"Session", session_id_text()}, {"Transport", transport_reply.str()}},
-            "");
-    }
-
-    if (request.method == "PLAY") {
-        if (!has_setup_tracks())
-            return send_response(454, "Session Not Found", cseq, {}, "");
-
-        const std::string req_session = session_id_only(get_header(request, "session"));
-        if (!req_session.empty() && req_session != session_id_text())
-            return send_response(454, "Session Not Found", cseq, {}, "");
-        const bool can_play_video = current_media_.video.present && video_ports_.setup && video_ports_.client_rtp != 0;
-        const bool can_play_audio = current_media_.audio.present && audio_ports_.setup && audio_ports_.client_rtp != 0;
-        if (current_media_path_.empty() || (!can_play_video && !can_play_audio))
-            return send_response(455, "Method Not Valid In This State", cseq, {}, "");
-        if (!std::filesystem::exists(current_media_path_))
-            return send_response(404, "Not Found", cseq, {}, "");
-
-        if (!start_streaming())
-            return send_response(500, "Internal Server Error", cseq, {}, "");
-
-        std::vector<std::pair<std::string, std::string>> headers;
-        headers.emplace_back("Session", session_id_text());
-        return send_response(200, "OK", cseq, headers, "");
-    }
-
-    if (request.method == "TEARDOWN") {
-        std::vector<std::pair<std::string, std::string>> headers;
-        if (has_setup_tracks())
-            headers.emplace_back("Session", session_id_text());
-        stop_streaming();
-        should_close = true;
-        return send_response(200, "OK", cseq, headers, "");
-    }
-
-    return send_response(501, "Not Implemented", cseq, {}, "");
-}
-
-void Session::run() {
-    std::string pending;
-    char buffer[4096];
-    bool should_close = false;
-
-    while (!should_close) {
-        const ssize_t nread = recv(client_fd_, buffer, sizeof(buffer), 0);
-        if (nread == 0)
-            break;
-        if (nread < 0) {
-            if (errno == EINTR)
-                continue;
-            log() << "recv() failed from " << remote_endpoint_ << ": " << std::strerror(errno);
-            break;
-        }
-
-        pending.append(buffer, static_cast<std::size_t>(nread));
-
-        while (!should_close) {
-            std::string request;
-            if (!extract_next_rtsp_request(pending, request))
-                break;
-            if (!handle_request(request, should_close)) {
-                should_close = true;
-                break;
-            }
-        }
-    }
-
-    stop_streaming();
-
-    const std::lock_guard<std::mutex> lock(fd_mutex_);
-    if (client_fd_ >= 0) {
-        close(client_fd_);
-        client_fd_ = -1;
-    }
+    return make_response(501, "Not Implemented", cseq, {}, "");
 }

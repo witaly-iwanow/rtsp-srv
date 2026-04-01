@@ -1,75 +1,30 @@
 #include "rtsp_server.h"
 #include "logger.h"
-#include "session.h"
 
-#include <arpa/inet.h>
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cctype>
-#include <csignal>
 #include <cstring>
-#include <netdb.h>
 #include <filesystem>
-#include <stdexcept>
+#include <csignal>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
 namespace {
 
-// max backlog for pending connections
-constexpr int kBacklog = 10;
+using asio::ip::tcp;
+
 constexpr std::array<const char*, 5> kSupportedExtensions = {".mp4", ".mkv", ".webm", ".mov", ".flv"};
-volatile std::sig_atomic_t g_stop_requested = 0;
 
-static void on_stop_signal(int) {
-    g_stop_requested = 1;
-}
-
-void install_signal_handlers() {
-    struct sigaction stop_sa {};
-    stop_sa.sa_handler = on_stop_signal;
-    sigemptyset(&stop_sa.sa_mask);
-    stop_sa.sa_flags = 0;  // do not restart accept(); we want EINTR on Ctrl-C
-    if (sigaction(SIGTERM, &stop_sa, nullptr) < 0)
-        LOG << "sigaction(SIGTERM) failed: " << std::strerror(errno);
-    if (sigaction(SIGINT, &stop_sa, nullptr) < 0)
-        LOG << "sigaction(SIGINT) failed: " << std::strerror(errno);
-
-    // to avoid crashing on writing to closed sockets when clients disconnect abruptly
+void install_sigpipe_handler() {
     struct sigaction ignore_sa {};
     ignore_sa.sa_handler = SIG_IGN;
     sigemptyset(&ignore_sa.sa_mask);
     ignore_sa.sa_flags = 0;
     if (sigaction(SIGPIPE, &ignore_sa, nullptr) < 0)
         LOG << "sigaction(SIGPIPE) failed: " << std::strerror(errno);
-}
-
-const void* get_in_addr(const sockaddr* sa) {
-    if (sa->sa_family == AF_INET)
-        return &reinterpret_cast<const sockaddr_in*>(sa)->sin_addr;
-
-    return &reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr;
-}
-
-std::string sockaddr_to_string(const sockaddr_storage& addr) {
-    char ip[INET6_ADDRSTRLEN];
-    const void* raw = get_in_addr(reinterpret_cast<const sockaddr*>(&addr));
-    if (!inet_ntop(addr.ss_family, raw, ip, sizeof(ip)))
-        return "<unknown>";
-
-    std::uint16_t port = 0;
-    if (addr.ss_family == AF_INET)
-        port = ntohs(reinterpret_cast<const sockaddr_in*>(&addr)->sin_port);
-    if (addr.ss_family == AF_INET6)
-        port = ntohs(reinterpret_cast<const sockaddr_in6*>(&addr)->sin6_port);
-
-    if (addr.ss_family == AF_INET6)
-        return std::string("[") + ip + "]:" + std::to_string(port);
-
-    return std::string(ip) + ":" + std::to_string(port);
 }
 
 std::string to_lower(std::string value) {
@@ -96,6 +51,13 @@ bool is_loopback_host(const std::string& host) {
     return host == "127.0.0.1" || host == "::1" || to_lower(host) == "localhost";
 }
 
+std::string endpoint_to_string(const tcp::endpoint& endpoint) {
+    const std::string host = endpoint.address().to_string();
+    if (endpoint.address().is_v6())
+        return "[" + host + "]:" + std::to_string(endpoint.port());
+    return host + ":" + std::to_string(endpoint.port());
+}
+
 std::size_t find_media_files(const std::filesystem::path& media_dir) {
     std::size_t count = 0;
     for (const auto& entry: std::filesystem::directory_iterator(media_dir)) {
@@ -109,153 +71,179 @@ std::size_t find_media_files(const std::filesystem::path& media_dir) {
     return count;
 }
 
-// just a little helper to ensure we always clean up
-struct ListenerGuard {
-    addrinfo* ai = nullptr;
-    int fd = -1;
-
-    ~ListenerGuard() {
-        if (ai)
-            freeaddrinfo(ai);
-        if (fd >= 0)
-            close(fd);
-    }
-};
-
-int open_listener(const std::string& host, std::uint16_t port) {
-    addrinfo hints {};
-    hints.ai_family = (host == "::" ? AF_INET6 : (host == "0.0.0.0" ? AF_INET : AF_UNSPEC));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = is_wildcard_host(host) ? AI_PASSIVE : 0;
-
-    if (is_loopback_host(host))
-        LOG << "Binding to loopback only (" << host << "). Remote clients will not connect; feel free to shoot yourself in the foot.";
-
-    ListenerGuard listener;
-    const auto service = std::to_string(port);
-    const char* node = is_wildcard_host(host) ? nullptr : host.c_str();
-    const int rv = getaddrinfo(node, service.c_str(), &hints, &listener.ai);
-    if (rv != 0 || !listener.ai) {
-        LOG << "getaddrinfo for " << host << ":" << service << " failed with " << gai_strerror(rv);
-        return -1;
+std::vector<tcp::endpoint> resolve_bind_endpoints(
+    asio::io_context& io_context,
+    const std::string& host,
+    const std::string& service) {
+    tcp::resolver resolver(io_context);
+    asio::error_code ec;
+    const std::string node = is_wildcard_host(host) ? "" : host;
+    const tcp::resolver::flags flags = is_wildcard_host(host) ? tcp::resolver::passive : tcp::resolver::flags();
+    const auto results = resolver.resolve(node, service, flags, ec);
+    if (ec) {
+        const std::string display_host = node.empty() ? host : node;
+        LOG << "resolve(" << display_host << ":" << service << ") failed: " << ec.message();
+        return {};
     }
 
-    for (addrinfo* p = listener.ai; p; p = p->ai_next) {
-        if ((listener.fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
-            continue;
-
-        int yes = 1;
-        if (setsockopt(listener.fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes)))
-            LOG << "setsockopt(SO_REUSEADDR) failed";   // not critical, just log and continue
-
-        if (bind(listener.fd, p->ai_addr, p->ai_addrlen)) {
-            const int bind_errno = errno;
-            if (bind_errno == EACCES && port < 1024)
-                LOG << "Privileged port " << port << " requires sudo or CAP_NET_BIND_SERVICE";
-            else
-                LOG << "bind() failed with " << std::strerror(bind_errno);
-
-            close(listener.fd);
-            listener.fd = -1;
-
-            continue;
-        }
-
-        break;
-    }
-
-    if (listener.fd < 0) {
-        LOG << "Failed to bind to " << host << ":" << service;
-        return -1;
-    }
-
-    if (listen(listener.fd, kBacklog) < 0) {
-        LOG << "listen failed with " << std::strerror(errno);
-        return -1;
-    }
-
-    auto fd = listener.fd;
-    listener.fd = -1; // so that it doesn't get closed by the guard
-    return fd;
+    std::vector<tcp::endpoint> endpoints;
+    for (const auto& result: results)
+        endpoints.push_back(result.endpoint());
+    return endpoints;
 }
 
 }  // namespace
 
-void RtspServer::start_session(int client_fd, const std::string& remote_endpoint) {
-    SessionWorker worker;
-    worker.session =
-        std::make_unique<Session>(client_fd, remote_endpoint, media_dir_, next_session_id_.fetch_add(1, std::memory_order_relaxed));
-    worker.done = std::make_shared<std::atomic<bool>>(false);
-    Session* session_ptr = worker.session.get();
-    const std::shared_ptr<std::atomic<bool>> done = worker.done;
-    worker.thread = std::thread([this, session_ptr, remote_endpoint, done]() {
-        const int active = active_sessions_.fetch_add(1) + 1;
-        session_ptr->log() << "client connected: " << remote_endpoint << ", active sessions: " << active;
-        session_ptr->run();
-        const int after = active_sessions_.fetch_sub(1) - 1;
-        session_ptr->log() << "client disconnected: " << remote_endpoint << ", active sessions: " << after;
-        done->store(true, std::memory_order_release);
-        sessions_cv_.notify_one();
-    });
+RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service):
+    media_dir_(media_dir),
+    host_(host),
+    service_(std::move(service)),
+    acceptor_(io_context_),
+    signals_(io_context_, SIGINT, SIGTERM) {}
 
-    const std::lock_guard<std::mutex> lock(sessions_mutex_);
-    sessions_.push_back(std::move(worker));
-    sessions_cv_.notify_one();
+bool RtspServer::open_acceptor() {
+    const std::vector<tcp::endpoint> endpoints = resolve_bind_endpoints(io_context_, host_, service_);
+    if (endpoints.empty()) {
+        LOG << "Failed to resolve bind address " << host_ << ":" << service_;
+        return false;
+    }
+
+    if (is_loopback_host(host_))
+        LOG << "Binding to loopback only (" << host_ << "). Remote clients will not connect; feel free to shoot yourself in the foot.";
+
+    asio::error_code ec;
+    for (const tcp::endpoint& endpoint: endpoints) {
+        acceptor_.close(ec);
+        acceptor_.open(endpoint.protocol(), ec);
+        if (ec) {
+            LOG << "open(" << endpoint_to_string(endpoint) << ") failed: " << ec.message();
+            continue;
+        }
+
+        acceptor_.set_option(asio::socket_base::reuse_address(true), ec);
+        if (ec) {
+            LOG << "set_option(SO_REUSEADDR) failed: " << ec.message();
+            acceptor_.close();
+            continue;
+        }
+
+        if (endpoint.protocol() == tcp::v6() && host_ == "::") {
+            acceptor_.set_option(asio::ip::v6_only(false), ec);
+            if (ec) {
+                LOG << "set_option(IPV6_V6ONLY=0) failed: " << ec.message();
+                acceptor_.close();
+                continue;
+            }
+        }
+
+        acceptor_.bind(endpoint, ec);
+        if (ec) {
+            LOG << "bind(" << endpoint_to_string(endpoint) << ") failed: " << ec.message();
+            acceptor_.close();
+            continue;
+        }
+
+        acceptor_.listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            LOG << "listen() failed: " << ec.message();
+            acceptor_.close();
+            continue;
+        }
+
+        return true;
+    }
+
+    LOG << "Failed to bind to " << host_ << ":" << service_;
+    return false;
+}
+
+void RtspServer::start_accept() {
+    acceptor_.async_accept([this](asio::error_code ec, Socket socket) {
+        handle_accept(ec, std::move(socket));
+    });
+}
+
+void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
+    if (shutting_down_)
+        return;
+    if (ec) {
+        if (ec != asio::error::operation_aborted)
+            LOG << "accept() failed: " << ec.message();
+        if (!shutting_down_)
+            start_accept();
+        return;
+    }
+
+    asio::error_code endpoint_ec;
+    const std::string remote_endpoint = endpoint_to_string(socket.remote_endpoint(endpoint_ec));
+    if (endpoint_ec)
+        LOG << "remote_endpoint() failed: " << endpoint_ec.message();
+
+    const auto session_id = next_session_id_.fetch_add(1, std::memory_order_relaxed);
+    register_session(std::make_shared<Session>(
+        std::move(socket),
+        remote_endpoint,
+        media_dir_,
+        session_id,
+        [this](std::uint32_t id, const std::string& remote) { on_session_closed(id, remote); }));
+
+    start_accept();
+}
+
+void RtspServer::handle_stop_signal(asio::error_code ec, int) {
+    if (ec == asio::error::operation_aborted)
+        return;
+    if (ec) {
+        LOG << "signal handling failed: " << ec.message();
+        return;
+    }
+    shutdown();
 }
 
 void RtspServer::shutdown_sessions() {
-    std::vector<SessionWorker> workers;
-    {
-        const std::lock_guard<std::mutex> lock(sessions_mutex_);
-        workers.swap(sessions_);
-    }
-
-    if (workers.empty()) {
+    if (sessions_.empty()) {
         LOG << "No active sessions to shutdown";
         return;
     }
 
-    LOG << "Stopping " << workers.size() << " sessions";
-    for (auto& worker: workers)
-        if (worker.session)
-            worker.session->shutdown();
-    for (auto& worker: workers)
-        if (worker.thread.joinable())
-            worker.thread.join();
+    LOG << "Stopping " << sessions_.size() << " sessions";
+    for (auto& [_, session]: sessions_)
+        session->shutdown();
 }
 
-void RtspServer::cleanup_stale_sessions() {
-    while (true) {
-        std::vector<SessionWorker> finished;
-        {
-            std::unique_lock<std::mutex> lock(sessions_mutex_);
-            sessions_cv_.wait(lock, [this]() {
-                if (stop_reaper_)
-                    return true;
-                for (const auto& worker: sessions_)
-                    if (worker.done && worker.done->load(std::memory_order_acquire))
-                        return true;
-                return false;
-            });
+void RtspServer::shutdown() {
+    if (shutting_down_)
+        return;
 
-            if (stop_reaper_)
-                return;
+    shutting_down_ = true;
+    LOG << "Shutting down";
 
-            auto it = sessions_.begin();
-            while (it != sessions_.end()) {
-                if (it->done && it->done->load(std::memory_order_acquire)) {
-                    finished.push_back(std::move(*it));
-                    it = sessions_.erase(it);
-                    continue;
-                }
-                ++it;
-            }
-        }
+    asio::error_code ec;
+    acceptor_.cancel(ec);
+    acceptor_.close(ec);
+    signals_.cancel(ec);
+    shutdown_sessions();
+}
 
-        for (auto& worker: finished)
-            if (worker.thread.joinable())
-                worker.thread.join();
-    }
+void RtspServer::register_session(Session::Ptr session) {
+    const std::uint32_t session_id = session->session_id();
+    const std::string remote_endpoint = session->remote_endpoint();
+    sessions_.emplace(session_id, session);
+    session->log() << "client connected: " << remote_endpoint << ", active sessions: " << sessions_.size();
+    session->start();
+}
+
+void RtspServer::on_session_closed(std::uint32_t session_id, const std::string& remote_endpoint) {
+    const auto it = sessions_.find(session_id);
+    if (it == sessions_.end())
+        return;
+
+    Session::Ptr session = std::move(it->second);
+    sessions_.erase(it);
+    session->log() << "client disconnected: " << remote_endpoint << ", active sessions: " << sessions_.size();
+
+    if (shutting_down_ && sessions_.empty())
+        io_context_.stop();
 }
 
 int RtspServer::run() {
@@ -281,45 +269,19 @@ int RtspServer::run() {
         return 1;
     }
 
-    int listener = open_listener(host_, port_);
-    if (listener < 0)
+    if (!open_acceptor())
         return 1;
 
-    install_signal_handlers();
+    install_sigpipe_handler();
 
-    std::thread reaper_thread(&RtspServer::cleanup_stale_sessions, this);
-
-    LOG << "Listening on " << host_ << ':' << port_;
+    LOG << "Listening on " << host_ << ':' << service_;
     LOG << "Press Ctrl-C to stop";
+    signals_.async_wait([this](asio::error_code ec, int signal_number) {
+        handle_stop_signal(ec, signal_number);
+    });
+    start_accept();
 
-    while (!g_stop_requested) {
-        sockaddr_storage client_addr {};
-        socklen_t addr_len = sizeof(client_addr);
-        const int client_fd = accept(listener, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-        if (client_fd < 0) {
-            if (errno == EINTR && g_stop_requested)
-                break;
-            if (errno == EINTR)
-                continue;
-
-            LOG << "accept() failed: " << std::strerror(errno);
-            continue;
-        }
-
-        const std::string remote_endpoint = sockaddr_to_string(client_addr);
-        start_session(client_fd, remote_endpoint);
-    }
-
-    LOG << "Shutting down";
-    {
-        const std::lock_guard<std::mutex> lock(sessions_mutex_);
-        stop_reaper_ = true;
-    }
-    sessions_cv_.notify_all();
-    if (reaper_thread.joinable())
-        reaper_thread.join();
-    shutdown_sessions();
-    close(listener);
+    io_context_.run();
 
     return 0;
 }
