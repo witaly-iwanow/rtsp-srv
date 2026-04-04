@@ -215,12 +215,48 @@ private:
 struct ActiveTrack {
     int input_index = -1;
     OutputFormatContext output;
+    std::int64_t loop_input_start_ts = AV_NOPTS_VALUE;
+    std::int64_t loop_output_offset_ts = 0;
+    std::int64_t last_output_end_ts = AV_NOPTS_VALUE;
 
     void reset() {
         input_index = -1;
         output.reset();
+        loop_input_start_ts = AV_NOPTS_VALUE;
+        loop_output_offset_ts = 0;
+        last_output_end_ts = AV_NOPTS_VALUE;
+    }
+
+    void start_next_loop() {
+        if (last_output_end_ts != AV_NOPTS_VALUE)
+            loop_output_offset_ts = last_output_end_ts;
+        loop_input_start_ts = AV_NOPTS_VALUE;
     }
 };
+
+void keep_timestamps_monotonic(AVPacket* packet, ActiveTrack& track) {
+    const std::int64_t source_ts = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+    if (track.loop_input_start_ts == AV_NOPTS_VALUE && source_ts != AV_NOPTS_VALUE)
+        track.loop_input_start_ts = source_ts;
+
+    auto remap = [&](std::int64_t ts) {
+        if (ts == AV_NOPTS_VALUE)
+            return ts;
+        const std::int64_t base = track.loop_input_start_ts == AV_NOPTS_VALUE ? ts : track.loop_input_start_ts;
+        return ts - base + track.loop_output_offset_ts;
+    };
+
+    packet->pts = remap(packet->pts);
+    packet->dts = remap(packet->dts);
+
+    const std::int64_t out_ts = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+    if (out_ts == AV_NOPTS_VALUE)
+        return;
+
+    std::int64_t end_ts = out_ts + (packet->duration > 0 ? packet->duration : 1);
+    if (track.last_output_end_ts == AV_NOPTS_VALUE || end_ts > track.last_output_end_ts)
+        track.last_output_end_ts = end_ts;
+}
 
 std::string make_rtp_url(const StreamTarget& target) {
     std::ostringstream url;
@@ -600,6 +636,8 @@ void MediaStreamer::schedule_next_packet() {
                 finalize();
                 return;
             }
+            impl_->video.start_next_loop();
+            impl_->audio.start_next_loop();
             impl_->wall_start_us = AV_NOPTS_VALUE;
             impl_->media_start_us = AV_NOPTS_VALUE;
             continue;
@@ -642,6 +680,7 @@ void MediaStreamer::schedule_next_packet() {
         }
 
         av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
+        keep_timestamps_monotonic(current, *output);
         current->stream_index = 0;
         err = av_interleaved_write_frame(output->output.get(), current);
         impl_->packet.reset();
@@ -680,6 +719,7 @@ void MediaStreamer::handle_timer(asio::error_code ec) {
     if (output != nullptr) {
         AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
         av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
+        keep_timestamps_monotonic(current, *output);
         current->stream_index = 0;
         const int err = av_interleaved_write_frame(output->output.get(), current);
         impl_->packet.reset();
