@@ -72,7 +72,7 @@ private:
         localtime_r(&tt, &tm);
 
         std::ostringstream ts;
-        ts << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M") << "::"
+        ts << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M") << ':'
            << std::put_time(&tm, "%S") << '.' << std::setw(3) << std::setfill('0')
            << ms.count() << ']';
         return ts.str();
