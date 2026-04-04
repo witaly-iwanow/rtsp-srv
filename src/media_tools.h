@@ -1,13 +1,11 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
+#include <asio.hpp>
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 struct MediaTrack {
@@ -39,6 +37,7 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 class MediaStreamer {
 public:
     MediaStreamer(
+        asio::any_io_executor executor,
         std::filesystem::path media_path,
         MediaDescription media,
         StreamTarget video_target,
@@ -56,21 +55,12 @@ public:
     bool running() const;
 
 private:
-    void run();
-    void report_startup_result(bool ok, std::string error_text = {});
+    void start_on_executor();
+    void schedule_next_packet();
+    void handle_timer(asio::error_code ec);
+    void complete_startup(bool ok, std::string error_text = {});
+    void finalize();
 
-    std::filesystem::path media_path_;
-    MediaDescription media_;
-    StreamTarget video_target_;
-    StreamTarget audio_target_;
-    std::string rtp_cname_;
-    std::string log_prefix_;
-    std::thread worker_;
-    std::atomic<bool> stop_requested_ {false};
-    std::atomic<bool> running_ {false};
-    std::mutex state_mutex_;
-    std::condition_variable state_cv_;
-    bool startup_done_ = false;
-    bool startup_ok_ = false;
-    std::string startup_error_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };

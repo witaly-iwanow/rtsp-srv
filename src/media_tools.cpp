@@ -13,8 +13,10 @@ extern "C" {
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -59,12 +61,16 @@ void ensure_network_initialized() {
 
 class InputFormatContext {
 public:
+    InputFormatContext() = default;
+    InputFormatContext(const InputFormatContext&) = delete;
+    InputFormatContext& operator=(const InputFormatContext&) = delete;
+
     ~InputFormatContext() {
-        if (context_ != nullptr)
-            avformat_close_input(&context_);
+        reset();
     }
 
     bool open(const std::filesystem::path& media_path, std::string& error_text) {
+        reset();
         ensure_network_initialized();
         int err = avformat_open_input(&context_, media_path.c_str(), nullptr, nullptr);
         if (err < 0) {
@@ -84,13 +90,26 @@ public:
         return context_;
     }
 
+    void reset() {
+        if (context_ != nullptr)
+            avformat_close_input(&context_);
+    }
+
 private:
     AVFormatContext* context_ = nullptr;
 };
 
 class OutputFormatContext {
 public:
+    OutputFormatContext() = default;
+    OutputFormatContext(const OutputFormatContext&) = delete;
+    OutputFormatContext& operator=(const OutputFormatContext&) = delete;
+
     ~OutputFormatContext() {
+        reset();
+    }
+
+    void reset() {
         if (context_ == nullptr)
             return;
 
@@ -99,6 +118,9 @@ public:
         if (!(context_->oformat->flags & AVFMT_NOFILE) && context_->pb != nullptr)
             avio_closep(&context_->pb);
         avformat_free_context(context_);
+        context_ = nullptr;
+        stream_ = nullptr;
+        header_written_ = false;
     }
 
     bool init(
@@ -107,6 +129,7 @@ public:
         const std::string& rtp_cname,
         bool open_io,
         std::string& error_text) {
+        reset();
         int err = avformat_alloc_output_context2(&context_, nullptr, "rtp", url.c_str());
         if (err < 0 || context_ == nullptr) {
             error_text = "avformat_alloc_output_context2 failed: " + ffmpeg_error_text(err);
@@ -168,9 +191,16 @@ private:
 class PacketHandle {
 public:
     PacketHandle(): packet_(av_packet_alloc()) {}
+    PacketHandle(const PacketHandle&) = delete;
+    PacketHandle& operator=(const PacketHandle&) = delete;
 
     AVPacket* get() const {
         return packet_;
+    }
+
+    void reset() {
+        if (packet_ != nullptr)
+            av_packet_unref(packet_);
     }
 
     ~PacketHandle() {
@@ -185,6 +215,11 @@ private:
 struct ActiveTrack {
     int input_index = -1;
     OutputFormatContext output;
+
+    void reset() {
+        input_index = -1;
+        output.reset();
+    }
 };
 
 std::string make_rtp_url(const StreamTarget& target) {
@@ -328,20 +363,6 @@ bool build_sdp(
     return !sdp_out.empty();
 }
 
-bool wait_for_media_time(
-    std::condition_variable& state_cv,
-    std::mutex& state_mutex,
-    const std::atomic<bool>& stop_requested,
-    std::int64_t delay_us) {
-    if (delay_us <= 0)
-        return true;
-
-    std::unique_lock<std::mutex> lock(state_mutex);
-    return !state_cv.wait_for(lock, std::chrono::microseconds(delay_us), [&stop_requested]() {
-        return stop_requested.load();
-    });
-}
-
 bool rewind_input(AVFormatContext* input, std::string& error_text) {
     const int err = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BACKWARD);
     if (err < 0) {
@@ -399,172 +420,298 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
     return true;
 }
 
+struct MediaStreamer::Impl {
+    explicit Impl(asio::any_io_executor executor): strand(asio::make_strand(std::move(executor))), timer(strand) {}
+
+    asio::strand<asio::any_io_executor> strand;
+    asio::steady_timer timer;
+    std::filesystem::path media_path;
+    MediaDescription media;
+    StreamTarget video_target;
+    StreamTarget audio_target;
+    std::string rtp_cname;
+    std::string log_prefix;
+    InputFormatContext input;
+    ActiveTrack video;
+    ActiveTrack audio;
+    PacketHandle packet;
+    std::mutex state_mutex;
+    std::condition_variable state_cv;
+    std::atomic<bool> running {false};
+    bool stop_requested = false;
+    bool startup_done = false;
+    bool startup_ok = false;
+    bool startup_reported = false;
+    bool stop_done = true;
+    std::string startup_error;
+    std::int64_t wall_start_us = AV_NOPTS_VALUE;
+    std::int64_t media_start_us = AV_NOPTS_VALUE;
+};
+
 MediaStreamer::MediaStreamer(
+    asio::any_io_executor executor,
     std::filesystem::path media_path,
     MediaDescription media,
     StreamTarget video_target,
     StreamTarget audio_target,
     std::string rtp_cname,
     std::string log_prefix):
-    media_path_(std::move(media_path)),
-    media_(std::move(media)),
-    video_target_(std::move(video_target)),
-    audio_target_(std::move(audio_target)),
-    rtp_cname_(std::move(rtp_cname)),
-    log_prefix_(std::move(log_prefix)) {}
+    impl_(std::make_unique<Impl>(std::move(executor))) {
+    impl_->media_path = std::move(media_path);
+    impl_->media = std::move(media);
+    impl_->video_target = std::move(video_target);
+    impl_->audio_target = std::move(audio_target);
+    impl_->rtp_cname = std::move(rtp_cname);
+    impl_->log_prefix = std::move(log_prefix);
+}
 
 MediaStreamer::~MediaStreamer() {
     stop();
 }
 
 bool MediaStreamer::start() {
-    if (worker_.joinable())
+    if (impl_->running.load())
         return running();
 
-    stop_requested_.store(false);
-    running_.store(false);
     {
-        const std::lock_guard<std::mutex> lock(state_mutex_);
-        startup_done_ = false;
-        startup_ok_ = false;
-        startup_error_.clear();
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        impl_->stop_requested = false;
+        impl_->startup_done = false;
+        impl_->startup_ok = false;
+        impl_->startup_reported = false;
+        impl_->stop_done = false;
+        impl_->startup_error.clear();
     }
-
-    worker_ = std::thread([this]() {
-        run();
+    impl_->running.store(false);
+    asio::post(impl_->strand, [this]() {
+        start_on_executor();
     });
 
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    state_cv_.wait(lock, [this]() {
-        return startup_done_;
+    std::unique_lock<std::mutex> lock(impl_->state_mutex);
+    impl_->state_cv.wait(lock, [this]() {
+        return impl_->startup_done;
     });
 
-    if (startup_ok_)
+    if (impl_->startup_ok)
         return true;
 
-    lock.unlock();
-    if (worker_.joinable())
-        worker_.join();
-    if (!startup_error_.empty())
-        LOG << log_prefix_ << " media pipeline startup failed: " << startup_error_;
+    if (!impl_->startup_error.empty())
+        LOG << impl_->log_prefix << " media pipeline startup failed: " << impl_->startup_error;
     return false;
 }
 
 void MediaStreamer::stop() {
-    stop_requested_.store(true);
-    state_cv_.notify_all();
-    if (worker_.joinable())
-        worker_.join();
-    running_.store(false);
+    {
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        if (impl_->stop_done)
+            return;
+        impl_->stop_requested = true;
+    }
+    asio::post(impl_->strand, [this]() {
+        impl_->timer.cancel();
+        finalize();
+    });
+
+    std::unique_lock<std::mutex> lock(impl_->state_mutex);
+    impl_->state_cv.wait(lock, [this]() {
+        return impl_->stop_done;
+    });
 }
 
 bool MediaStreamer::running() const {
-    return running_.load();
+    return impl_->running.load();
 }
 
-void MediaStreamer::report_startup_result(bool ok, std::string error_text) {
+void MediaStreamer::complete_startup(bool ok, std::string error_text) {
     {
-        const std::lock_guard<std::mutex> lock(state_mutex_);
-        startup_done_ = true;
-        startup_ok_ = ok;
-        startup_error_ = std::move(error_text);
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        if (impl_->startup_reported)
+            return;
+        impl_->startup_done = true;
+        impl_->startup_ok = ok;
+        impl_->startup_reported = true;
+        impl_->startup_error = std::move(error_text);
     }
-    state_cv_.notify_all();
+    impl_->state_cv.notify_all();
 }
 
-void MediaStreamer::run() {
-    InputFormatContext input;
+void MediaStreamer::start_on_executor() {
     std::string error_text;
-    if (!input.open(media_path_, error_text)) {
-        report_startup_result(false, std::move(error_text));
+    if (!impl_->input.open(impl_->media_path, error_text)) {
+        complete_startup(false, std::move(error_text));
+        finalize();
         return;
     }
 
-    ActiveTrack video;
-    ActiveTrack audio;
-
-    if (video_target_.enabled) {
-        video.input_index = media_.video.stream_index;
-        if (!video.output.init(make_rtp_url(video_target_), input.get()->streams[video.input_index], rtp_cname_, true, error_text)) {
-            report_startup_result(false, std::move(error_text));
+    if (impl_->video_target.enabled) {
+        impl_->video.input_index = impl_->media.video.stream_index;
+        if (!impl_->video.output.init(
+                make_rtp_url(impl_->video_target),
+                impl_->input.get()->streams[impl_->video.input_index],
+                impl_->rtp_cname,
+                true,
+                error_text)) {
+            complete_startup(false, std::move(error_text));
+            finalize();
             return;
         }
     }
 
-    if (audio_target_.enabled) {
-        audio.input_index = media_.audio.stream_index;
-        if (!audio.output.init(make_rtp_url(audio_target_), input.get()->streams[audio.input_index], rtp_cname_, true, error_text)) {
-            report_startup_result(false, std::move(error_text));
+    if (impl_->audio_target.enabled) {
+        impl_->audio.input_index = impl_->media.audio.stream_index;
+        if (!impl_->audio.output.init(
+                make_rtp_url(impl_->audio_target),
+                impl_->input.get()->streams[impl_->audio.input_index],
+                impl_->rtp_cname,
+                true,
+                error_text)) {
+            complete_startup(false, std::move(error_text));
+            finalize();
             return;
         }
     }
 
-    PacketHandle packet;
-    if (packet.get() == nullptr) {
-        report_startup_result(false, "av_packet_alloc failed");
+    if (impl_->packet.get() == nullptr) {
+        complete_startup(false, "av_packet_alloc failed");
+        finalize();
         return;
     }
 
-    running_.store(true);
-    report_startup_result(true);
+    impl_->running.store(true);
+    impl_->wall_start_us = AV_NOPTS_VALUE;
+    impl_->media_start_us = AV_NOPTS_VALUE;
+    complete_startup(true);
+    schedule_next_packet();
+}
 
-    std::int64_t wall_start_us = AV_NOPTS_VALUE;
-    std::int64_t media_start_us = AV_NOPTS_VALUE;
+void MediaStreamer::schedule_next_packet() {
+    if (impl_->stop_requested) {
+        finalize();
+        return;
+    }
 
-    while (!stop_requested_.load()) {
-        AVPacket* current = packet.get();
-        int err = av_read_frame(input.get(), current);
+    while (!impl_->stop_requested) {
+        AVPacket* current = impl_->packet.get();
+        int err = av_read_frame(impl_->input.get(), current);
         if (err == AVERROR_EOF) {
-            if (!rewind_input(input.get(), error_text)) {
-                LOG << log_prefix_ << " rewind failed: " << error_text;
-                break;
+            std::string error_text;
+            if (!rewind_input(impl_->input.get(), error_text)) {
+                LOG << impl_->log_prefix << " rewind failed: " << error_text;
+                finalize();
+                return;
             }
-            wall_start_us = AV_NOPTS_VALUE;
-            media_start_us = AV_NOPTS_VALUE;
+            impl_->wall_start_us = AV_NOPTS_VALUE;
+            impl_->media_start_us = AV_NOPTS_VALUE;
             continue;
         }
         if (err < 0) {
-            LOG << log_prefix_ << " av_read_frame failed: " << ffmpeg_error_text(err);
-            break;
+            LOG << impl_->log_prefix << " av_read_frame failed: " << ffmpeg_error_text(err);
+            finalize();
+            return;
         }
 
         ActiveTrack* output = nullptr;
-        if (video_target_.enabled && current->stream_index == video.input_index)
-            output = &video;
-        else if (audio_target_.enabled && current->stream_index == audio.input_index)
-            output = &audio;
+        if (impl_->video_target.enabled && current->stream_index == impl_->video.input_index)
+            output = &impl_->video;
+        else if (impl_->audio_target.enabled && current->stream_index == impl_->audio.input_index)
+            output = &impl_->audio;
 
         if (output == nullptr) {
-            av_packet_unref(current);
+            impl_->packet.reset();
             continue;
         }
 
-        AVStream* input_stream = input.get()->streams[current->stream_index];
+        AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
         const std::int64_t ts = current->pts != AV_NOPTS_VALUE ? current->pts : current->dts;
         if (ts != AV_NOPTS_VALUE) {
             const std::int64_t packet_time_us = av_rescale_q(ts, input_stream->time_base, AV_TIME_BASE_Q);
-            if (media_start_us == AV_NOPTS_VALUE) {
-                media_start_us = packet_time_us;
-                wall_start_us = av_gettime_relative();
-            } else {
-                const std::int64_t target_time_us = wall_start_us + (packet_time_us - media_start_us);
-                const std::int64_t delay_us = target_time_us - av_gettime_relative();
-                if (!wait_for_media_time(state_cv_, state_mutex_, stop_requested_, delay_us)) {
-                    av_packet_unref(current);
-                    break;
-                }
+            if (impl_->media_start_us == AV_NOPTS_VALUE) {
+                impl_->media_start_us = packet_time_us;
+                impl_->wall_start_us = av_gettime_relative();
+            }
+
+            const std::int64_t target_time_us = impl_->wall_start_us + (packet_time_us - impl_->media_start_us);
+            const std::int64_t delay_us = target_time_us - av_gettime_relative();
+            if (delay_us > 0) {
+                impl_->timer.expires_after(std::chrono::microseconds(delay_us));
+                impl_->timer.async_wait(asio::bind_executor(impl_->strand, [this](asio::error_code ec) {
+                    handle_timer(ec);
+                }));
+                return;
             }
         }
 
         av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
         current->stream_index = 0;
         err = av_interleaved_write_frame(output->output.get(), current);
-        av_packet_unref(current);
+        impl_->packet.reset();
         if (err < 0) {
-            LOG << log_prefix_ << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
-            break;
+            LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
+            finalize();
+            return;
         }
     }
+}
 
-    running_.store(false);
+void MediaStreamer::handle_timer(asio::error_code ec) {
+    if (ec == asio::error::operation_aborted) {
+        if (impl_->stop_requested)
+            finalize();
+        return;
+    }
+    if (ec) {
+        LOG << impl_->log_prefix << " timer failed: " << ec.message();
+        finalize();
+        return;
+    }
+
+    if (impl_->stop_requested) {
+        finalize();
+        return;
+    }
+
+    AVPacket* current = impl_->packet.get();
+    ActiveTrack* output = nullptr;
+    if (impl_->video_target.enabled && current->stream_index == impl_->video.input_index)
+        output = &impl_->video;
+    else if (impl_->audio_target.enabled && current->stream_index == impl_->audio.input_index)
+        output = &impl_->audio;
+
+    if (output != nullptr) {
+        AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
+        av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
+        current->stream_index = 0;
+        const int err = av_interleaved_write_frame(output->output.get(), current);
+        impl_->packet.reset();
+        if (err < 0) {
+            LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
+            finalize();
+            return;
+        }
+    } else {
+        impl_->packet.reset();
+    }
+
+    schedule_next_packet();
+}
+
+void MediaStreamer::finalize() {
+    if (impl_->running.exchange(false)) {
+        impl_->timer.cancel();
+    }
+    impl_->video.reset();
+    impl_->audio.reset();
+    impl_->input.reset();
+    impl_->packet.reset();
+
+    {
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        impl_->stop_done = true;
+        if (!impl_->startup_reported) {
+            impl_->startup_done = true;
+            impl_->startup_ok = false;
+            impl_->startup_reported = true;
+        }
+    }
+    impl_->state_cv.notify_all();
 }

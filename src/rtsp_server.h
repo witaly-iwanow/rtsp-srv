@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 class RtspServer {
@@ -33,6 +34,7 @@ private:
     std::string host_;
     std::string service_;
     asio::io_context io_context_;
+    asio::thread_pool media_pool_;
     Acceptor acceptor_;
     asio::signal_set signals_;
     std::unordered_map<std::uint32_t, Session::Ptr> sessions_;

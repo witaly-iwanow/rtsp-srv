@@ -286,11 +286,13 @@ Session::Session(
     Socket socket,
     std::string remote_endpoint,
     const std::filesystem::path& media_dir,
+    MediaExecutor media_executor,
     std::uint32_t session_id,
     CloseHandler on_close):
     socket_(std::move(socket)),
     remote_endpoint_(std::move(remote_endpoint)),
     media_dir_(media_dir),
+    media_executor_(std::move(media_executor)),
     session_id_(session_id),
     on_close_(std::move(on_close)) {
     const auto [video_rtp, video_rtcp] = make_server_ports(session_id_, 50000);
@@ -543,6 +545,7 @@ bool Session::start_streaming() {
     }
 
     auto streamer = std::make_unique<MediaStreamer>(
+        media_executor_,
         current_media_path_,
         current_media_,
         video_target,

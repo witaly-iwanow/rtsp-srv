@@ -19,12 +19,14 @@ class Session : public std::enable_shared_from_this<Session> {
 public:
     using Ptr = std::shared_ptr<Session>;
     using Socket = asio::ip::tcp::socket;
+    using MediaExecutor = asio::any_io_executor;
     using CloseHandler = std::function<void(std::uint32_t, const std::string&)>;
 
     Session(
         Socket socket,
         std::string remote_endpoint,
         const std::filesystem::path& media_dir,
+        MediaExecutor media_executor,
         std::uint32_t session_id,
         CloseHandler on_close);
 
@@ -89,6 +91,7 @@ private:
     Socket socket_;
     std::string remote_endpoint_;
     std::filesystem::path media_dir_;
+    MediaExecutor media_executor_;
     std::uint32_t session_id_;
     CloseHandler on_close_;
     std::string current_media_uri_;

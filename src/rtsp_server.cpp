@@ -18,6 +18,11 @@ using asio::ip::tcp;
 
 constexpr std::array<const char*, 5> kSupportedExtensions = {".mp4", ".mkv", ".webm", ".mov", ".flv"};
 
+std::size_t default_media_threads() {
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    return std::max<std::size_t>(2, hardware_threads == 0 ? 4 : hardware_threads);
+}
+
 void install_sigpipe_handler() {
     struct sigaction ignore_sa {};
     ignore_sa.sa_handler = SIG_IGN;
@@ -98,6 +103,7 @@ RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string
     media_dir_(media_dir),
     host_(host),
     service_(std::move(service)),
+    media_pool_(default_media_threads()),
     acceptor_(io_context_),
     signals_(io_context_, SIGINT, SIGTERM) {}
 
@@ -184,6 +190,7 @@ void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
         std::move(socket),
         remote_endpoint,
         media_dir_,
+        media_pool_.get_executor(),
         session_id,
         [this](std::uint32_t id, const std::string& remote) { on_session_closed(id, remote); }));
 
@@ -282,6 +289,7 @@ int RtspServer::run() {
     start_accept();
 
     io_context_.run();
+    media_pool_.join();
 
     return 0;
 }
