@@ -83,6 +83,10 @@ std::string strip_track_suffix(const std::string& uri) {
     return uri.substr(0, pos);
 }
 
+bool has_track_suffix(const std::string& uri) {
+    return uri.rfind("/trackID=") != std::string::npos;
+}
+
 bool parse_track_id(const std::string& uri, int& track_id) {
     const std::size_t pos = uri.rfind("/trackID=");
     if (pos == std::string::npos)
@@ -239,6 +243,8 @@ bool parse_media_relative_path(const std::string& uri, std::filesystem::path& re
     const std::size_t query = path.find_first_of("?#");
     if (query != std::string::npos)
         path = path.substr(0, query);
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
     if (path.empty())
         return false;
 
@@ -616,10 +622,6 @@ Session::RequestOutcome Session::handle_setup(
     if (!std::filesystem::exists(media_path))
         return make_response(404, "Not Found", cseq, {}, "");
 
-    int track_id = -1;
-    if (!parse_track_id(uri, track_id))
-        return make_response(400, "Bad Request", cseq, {}, "");
-
     if (has_setup_tracks()) {
         const std::string req_session = session_id_only(session_header);
         if (!req_session.empty() && req_session != session_id_text())
@@ -633,6 +635,20 @@ Session::RequestOutcome Session::handle_setup(
 
     if (!load_media_description(media_path, media_uri))
         return make_response(415, "Unsupported Media Type", cseq, {}, "");
+
+    // Accept aggregate SETUP only for single-track media; for A+V, require explicit /trackID=...
+    int track_id = -1;
+    if (!parse_track_id(uri, track_id)) {
+        if (has_track_suffix(uri))
+            return make_response(400, "Bad Request", cseq, {}, "");
+
+        const bool has_video = current_media_.video.present;
+        const bool has_audio = current_media_.audio.present;
+        if (has_video == has_audio)
+            return make_response(400, "Bad Request", cseq, {}, "");
+
+        track_id = has_video ? video_track_id(current_media_) : audio_track_id(current_media_);
+    }
 
     if (!track_id_is_valid(current_media_, track_id))
         return make_response(404, "Not Found", cseq, {}, "");

@@ -14,6 +14,7 @@ struct MediaTrack {
     int channels = 0;
     int sample_rate = 0;
     int stream_index = -1;
+    int rtp_payload_type = -1;
     std::string codec_name;
 };
 

@@ -44,6 +44,21 @@ bool is_passthrough_audio_codec(AVCodecID codec_id) {
         || codec_id == AV_CODEC_ID_MP2 || codec_id == AV_CODEC_ID_MP3;
 }
 
+bool parse_int(const std::string& text, int& out) {
+    if (text.empty())
+        return false;
+    try {
+        std::size_t pos = 0;
+        const int value = std::stoi(text, &pos);
+        if (pos != text.size())
+            return false;
+        out = value;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 std::string ffmpeg_error_text(int errnum) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer {};
     av_strerror(errnum, buffer.data(), buffer.size());
@@ -128,6 +143,7 @@ public:
         AVStream* input_stream,
         const std::string& rtp_cname,
         bool open_io,
+        int payload_type,
         std::string& error_text) {
         reset();
         int err = avformat_alloc_output_context2(&context_, nullptr, "rtp", url.c_str());
@@ -147,6 +163,8 @@ public:
             error_text = "avcodec_parameters_copy failed: " + ffmpeg_error_text(err);
             return false;
         }
+        if (payload_type >= 0 && payload_type <= 127)
+            stream_->id = payload_type;
         stream_->codecpar->codec_tag = 0;
         stream_->time_base = input_stream->time_base;
         stream_->avg_frame_rate = input_stream->avg_frame_rate;
@@ -164,6 +182,11 @@ public:
 
         AVDictionary* options = nullptr;
         av_dict_set(&options, "cname", rtp_cname.c_str(), 0);
+        std::string payload_type_text;
+        if (payload_type >= 96 && payload_type <= 127) {
+            payload_type_text = std::to_string(payload_type);
+            av_dict_set(&options, "payload_type", payload_type_text.c_str(), 0);
+        }
         err = avformat_write_header(context_, &options);
         av_dict_free(&options);
         if (err < 0) {
@@ -272,49 +295,42 @@ std::string make_rtp_url(const StreamTarget& target) {
     return url.str();
 }
 
-std::string normalize_sdp(const std::string& raw_sdp, const std::string& media_name) {
+std::string normalize_sdp(const std::string& raw_sdp) {
     std::istringstream iss(raw_sdp);
-    std::vector<std::string> lines;
+    std::vector<std::string> cleaned;
     std::string line;
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (!line.empty())
-            lines.push_back(line);
+        if (line.empty())
+            continue;
+        if (line.rfind("a=control:", 0) == 0)
+            continue;
+        cleaned.push_back(line);
     }
 
+    int media_count = 0;
+    for (const std::string& cleaned_line: cleaned)
+        if (cleaned_line.rfind("m=", 0) == 0)
+            ++media_count;
+
+    // RTSP clients need explicit session and track control attributes.
     std::vector<std::string> normalized;
-    normalized.reserve(lines.size() + 4);
+    normalized.reserve(cleaned.size() + 4 + static_cast<std::size_t>(media_count));
     bool has_session_control = false;
     bool has_time = false;
     int track_id = -1;
-    for (const std::string& original: lines) {
-        if (original.rfind("a=control:", 0) == 0)
-            continue;
-
-        std::string current = original;
-        if (current.rfind("s=", 0) == 0)
-            current = "s=" + media_name;
-        else if (current.rfind("c=", 0) == 0)
-            current = "c=IN IP4 0.0.0.0";
-        else if (current.rfind("m=", 0) == 0) {
+    for (const std::string& cleaned_line: cleaned) {
+        if (cleaned_line.rfind("m=", 0) == 0) {
             if (track_id >= 0)
                 normalized.emplace_back("a=control:trackID=" + std::to_string(track_id));
             ++track_id;
-
-            std::istringstream media_line(current);
-            std::string prefix;
-            std::string media_type;
-            std::string port;
-            std::string proto;
-            if ((media_line >> prefix >> port >> proto))
-                current = prefix + " 0 " + proto + current.substr(prefix.size() + 1 + port.size() + 1 + proto.size());
-        } else if (current.rfind("t=", 0) == 0) {
+        } else if (cleaned_line.rfind("t=", 0) == 0) {
             has_time = true;
         }
 
-        normalized.push_back(current);
-        if (current.rfind("t=", 0) == 0 && !has_session_control) {
+        normalized.push_back(cleaned_line);
+        if (cleaned_line.rfind("t=", 0) == 0 && !has_session_control) {
             normalized.emplace_back("a=control:*");
             has_session_control = true;
         }
@@ -336,6 +352,37 @@ std::string normalize_sdp(const std::string& raw_sdp, const std::string& media_n
     return sdp.str();
 }
 
+void remember_payload_types_from_sdp(const std::string& sdp, MediaDescription& media) {
+    media.video.rtp_payload_type = -1;
+    media.audio.rtp_payload_type = -1;
+
+    std::istringstream iss(sdp);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.rfind("m=", 0) != 0)
+            continue;
+
+        std::istringstream ls(line.substr(2));
+        std::string media_type;
+        std::string port;
+        std::string proto;
+        std::string payload_text;
+        if (!(ls >> media_type >> port >> proto >> payload_text))
+            continue;
+
+        int payload_type = -1;
+        if (!parse_int(payload_text, payload_type))
+            continue;
+
+        if (media_type == "video" && media.video.present && media.video.rtp_payload_type < 0)
+            media.video.rtp_payload_type = payload_type;
+        else if (media_type == "audio" && media.audio.present && media.audio.rtp_payload_type < 0)
+            media.audio.rtp_payload_type = payload_type;
+    }
+}
+
 bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) {
     if (stream == nullptr || stream->codecpar == nullptr)
         return false;
@@ -352,8 +399,7 @@ bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) 
 
 bool build_sdp(
     AVFormatContext* input,
-    const MediaDescription& media,
-    const std::string& media_name,
+    MediaDescription& media,
     std::string& sdp_out,
     std::string& error_text) {
     std::vector<std::unique_ptr<OutputFormatContext>> outputs;
@@ -373,7 +419,13 @@ bool build_sdp(
         target.server_rtcp = static_cast<std::uint16_t>(port + 1);
 
         auto output = std::make_unique<OutputFormatContext>();
-        if (!output->init(make_rtp_url(target), input->streams[track.stream_index], "rtsp-sdp", false, error_text))
+        if (!output->init(
+                make_rtp_url(target),
+                input->streams[track.stream_index],
+                "rtsp-sdp",
+                false,
+                -1,
+                error_text))
             return false;
 
         contexts.push_back(output->get());
@@ -395,7 +447,8 @@ bool build_sdp(
         return false;
     }
 
-    sdp_out = normalize_sdp(std::string(buffer.data()), media_name);
+    sdp_out = normalize_sdp(std::string(buffer.data()));
+    remember_payload_types_from_sdp(sdp_out, media);
     return !sdp_out.empty();
 }
 
@@ -448,7 +501,7 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
         return false;
     }
 
-    if (!build_sdp(input.get(), media, media_path.filename().string(), media.sdp, error_text)) {
+    if (!build_sdp(input.get(), media, media.sdp, error_text)) {
         LOG << "Failed to build SDP for " << media_path << ": " << error_text;
         return false;
     }
@@ -586,6 +639,7 @@ void MediaStreamer::start_on_executor() {
                 impl_->input.get()->streams[impl_->video.input_index],
                 impl_->rtp_cname,
                 true,
+                impl_->media.video.rtp_payload_type,
                 error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
@@ -600,6 +654,7 @@ void MediaStreamer::start_on_executor() {
                 impl_->input.get()->streams[impl_->audio.input_index],
                 impl_->rtp_cname,
                 true,
+                impl_->media.audio.rtp_payload_type,
                 error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
