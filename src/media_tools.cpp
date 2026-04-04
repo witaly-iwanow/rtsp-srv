@@ -659,10 +659,6 @@ void MediaStreamer::schedule_next_packet() {
             continue;
         }
 
-        const char* track_name = (output == &impl_->audio) ? "audio" : "video";
-        LOG << impl_->log_prefix << ' ' << track_name << " packet read pts=" << current->pts
-            << " dts=" << current->dts << " duration=" << current->duration << " size=" << current->size;
-
         AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
         const std::int64_t ts = current->pts != AV_NOPTS_VALUE ? current->pts : current->dts;
         if (ts != AV_NOPTS_VALUE) {
@@ -693,7 +689,6 @@ void MediaStreamer::schedule_next_packet() {
             finalize();
             return;
         }
-        LOG << impl_->log_prefix << ' ' << track_name << " packet written";
     }
 }
 
@@ -733,8 +728,6 @@ void MediaStreamer::handle_timer(asio::error_code ec) {
             finalize();
             return;
         }
-        const char* track_name = (output == &impl_->audio) ? "audio" : "video";
-        LOG << impl_->log_prefix << ' ' << track_name << " packet written";
     } else {
         impl_->packet.reset();
     }

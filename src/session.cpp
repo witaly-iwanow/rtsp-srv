@@ -583,8 +583,6 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
     if (!load_media_description(media_path, media_uri))
         return make_response(415, "Unsupported Media Type", cseq, {}, "");
 
-    log() << "SDP:\n" << current_media_.sdp;
-
     std::string base = current_media_uri_;
     if (!base.empty() && base.back() != '/')
         base += '/';
