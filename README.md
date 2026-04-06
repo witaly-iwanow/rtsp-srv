@@ -35,20 +35,25 @@ Examples:
 
 ```bash
 sudo ./build/rtsp_server
-./build/rtsp_server . 8554
-./build/rtsp_server ~/media [::]:8554
+./build/rtsp_server ./media 8554
+./build/rtsp_server ./media [::]:8554
 ```
 
 To play a file with VLC:
 
 ```bash
-vlc rtsp://127.0.0.1:554/tos-480p.mp4
+vlc rtsp://127.0.0.1:554/media/tos-480p.mp4
 ```
+or
+```bash
+vlc rtsp://127.0.0.1:8554/tos-480p.mp4
+```
+depending on how you launched the server.
 
 To play the same file with `ffplay`:
 
 ```bash
-ffplay rtsp://127.0.0.1:554/tos-480p.mp4
+ffplay rtsp://127.0.0.1:554/media/tos-480p.mp4
 ```
 
 Note: the `apt`-installed VLC on Debian / Ubuntu does not provide RTSP client support in a useful default configuration for this project. If you want to test with VLC there, either build VLC from source with `--enable-live555` or install VLC from `snap`.
