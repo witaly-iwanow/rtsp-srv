@@ -10,7 +10,6 @@
 
 struct MediaTrack {
     bool present = false;
-    bool copy = false;
     int channels = 0;
     int sample_rate = 0;
     int stream_index = -1;

@@ -1,14 +1,15 @@
 # Demo RTSP Server
 
-A simple RTSP server for serving local media files over RTP, based on `Asio` for async I/O and networking, and `libavformat`, `libavcodec`, and `libavutil` for transmuxing and transcoding. The server implements the RTSP control logic and streams requested files in a loop, and can serve multiple clients simultaneously.
+A simple RTSP server for serving local media files over RTP, based on `Asio` for async I/O and networking, and `libavformat`, `libavcodec`, and `libavutil` for in-process demuxing and RTP packetization. The server implements the RTSP control logic and streams requested files in a loop, and can serve multiple clients simultaneously.
 
-The server supports video-only, audio-only, and audio+video inputs. In practice it can handle any format FFmpeg supports.
+The server supports video-only, audio-only, and audio+video inputs. It inspects containers through FFmpeg and exposes only tracks with codecs the RTP path supports.
 
 The server handles `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, and `TEARDOWN`. SDP is generated in-process from RTP muxer contexts, and on `PLAY` the server opens the requested file itself and writes RTP packets directly to the client ports negotiated during `SETUP`.
 Supported RTSP transport: UDP unicast RTP/RTCP with `client_port=` negotiation. Interleaved RTP over RTSP/TCP is not implemented.
 
-Video codecs: HEVC, AVC, VP8, VP9 and MPEG-2 are sent as-is; other video codecs are transcoded to AVC as a precaution. AV1 can be added to the list with FFmpeg 7.1 or later, just add `-bsf:v av1_frame_split -strict experimental` for this case.
-Audio codecs: Opus, AAC and MPEG Audio Layers 1/2/3 are sent as-is; other audio codecs are transcoded to Opus.
+Video codecs: HEVC, AVC, VP8, VP9 and MPEG-2 are streamed when present.
+Audio codecs: Opus, AAC and MPEG Audio Layers 1/2/3 are streamed when present.
+Unsupported tracks are omitted, so a file like `AV1 + Opus` is served as audio-only.
 
 ## Build
 

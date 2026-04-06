@@ -27,12 +27,12 @@ namespace {
 constexpr std::uint16_t kDescribeVideoRtpPort = 40000;
 constexpr std::uint16_t kDescribeAudioRtpPort = 40002;
 
-bool is_passthrough_video_codec(AVCodecID codec_id) {
+bool is_supported_video_codec(AVCodecID codec_id) {
     return codec_id == AV_CODEC_ID_HEVC || codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_MPEG2VIDEO
         || codec_id == AV_CODEC_ID_VP8 || codec_id == AV_CODEC_ID_VP9;
 }
 
-bool is_passthrough_audio_codec(AVCodecID codec_id) {
+bool is_supported_audio_codec(AVCodecID codec_id) {
     return codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_MP1
         || codec_id == AV_CODEC_ID_MP2 || codec_id == AV_CODEC_ID_MP3;
 }
@@ -108,8 +108,9 @@ public:
 
         if (header_written_)
             av_write_trailer(context_);
-        if (!(context_->oformat->flags & AVFMT_NOFILE) && context_->pb != nullptr)
+        if (!(context_->oformat->flags & AVFMT_NOFILE) && context_->pb)
             avio_closep(&context_->pb);
+
         avformat_free_context(context_);
         context_ = nullptr;
         stream_ = nullptr;
@@ -420,14 +421,18 @@ bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) 
     if (stream == nullptr || stream->codecpar == nullptr)
         return false;
 
+    const AVCodecID codec_id = stream->codecpar->codec_id;
+    const bool supported = is_video ? is_supported_video_codec(codec_id) : is_supported_audio_codec(codec_id);
+    if (!supported)
+        return false;
+
+    track = {};
     track.present = true;
     track.stream_index = stream->index;
-    track.codec_name = util::to_lower(avcodec_get_name(stream->codecpar->codec_id));
+    track.codec_name = util::to_lower(avcodec_get_name(codec_id));
     track.channels = stream->codecpar->ch_layout.nb_channels;
     track.sample_rate = stream->codecpar->sample_rate;
-    track.copy = is_video ? is_passthrough_video_codec(stream->codecpar->codec_id)
-                          : is_passthrough_audio_codec(stream->codecpar->codec_id);
-    return track.copy;
+    return true;
 }
 
 bool build_sdp(
@@ -594,18 +599,16 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 
         if (!media.video.present && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (!fill_track_description(stream, true, media.video)) {
-                LOG << "Unsupported video codec " << avcodec_get_name(stream->codecpar->codec_id)
+                LOG << "Skipping unsupported video codec " << avcodec_get_name(stream->codecpar->codec_id)
                     << " in " << media_path;
-                return false;
             }
             continue;
         }
 
         if (!media.audio.present && stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (!fill_track_description(stream, false, media.audio)) {
-                LOG << "Unsupported audio codec " << avcodec_get_name(stream->codecpar->codec_id)
+                LOG << "Skipping unsupported audio codec " << avcodec_get_name(stream->codecpar->codec_id)
                     << " in " << media_path;
-                return false;
             }
         }
     }

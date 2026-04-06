@@ -477,16 +477,14 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
     current_media_ = std::move(media);
 
     if (current_media_.video.present) {
-        log() << "selected video codec " << current_media_.video.codec_name
-              << (current_media_.video.copy ? " via passthrough" : " via libx264 transcode");
+        log() << "selected video codec " << current_media_.video.codec_name;
     } else {
-        log() << "no video track detected";
+        log() << "no supported video track detected";
     }
     if (current_media_.audio.present) {
-        log() << "selected audio codec " << current_media_.audio.codec_name
-              << (current_media_.audio.copy ? " via passthrough" : " via libopus transcode");
+        log() << "selected audio codec " << current_media_.audio.codec_name;
     } else {
-        log() << "no audio track detected";
+        log() << "no supported audio track detected";
     }
 
     return true;
