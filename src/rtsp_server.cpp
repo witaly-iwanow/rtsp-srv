@@ -140,7 +140,10 @@ void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
         return;
 
     if (ec) {
-        LOG << "accept() failed: " << ec.message();
+        if (ec != asio::error::operation_aborted)
+            LOG << "accept() failed: " << ec.message();
+        // Keep the listener alive after transient accept failures.
+        start_accept();
         return;
     }
 
