@@ -2,6 +2,7 @@
 #include "logger.h"
 #include "utils.h"
 
+#include <charconv>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -69,21 +70,18 @@ bool parse_track_id(const std::string& uri, int& track_id) {
     if (pos == std::string::npos)
         return false;
 
-    std::string value = uri.substr(pos + std::strlen("/trackID="));
+    std::string_view value(uri.data() + pos + std::strlen("/trackID="), uri.size() - pos - std::strlen("/trackID="));
     const std::size_t suffix = value.find_first_of("?#");
     if (suffix != std::string::npos)
         value = value.substr(0, suffix);
     if (value.empty())
         return false;
 
-    int parsed = 0;
-    try {
-        parsed = std::stoi(value);
-    } catch (const std::exception&) {
+    int parsed = -1;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (ec != std::errc() || ptr != value.data() + value.size())
         return false;
-    }
-
-    if (std::to_string(parsed) != value)
+    if (parsed < 0)
         return false;
 
     track_id = parsed;
@@ -91,27 +89,30 @@ bool parse_track_id(const std::string& uri, int& track_id) {
 }
 
 std::size_t parse_content_length(const std::string& headers) {
-    constexpr const char* kContentLength = "content-length:";
-    std::size_t start = 0;
-    while (start < headers.size()) {
-        const std::size_t end = headers.find("\r\n", start);
-        const std::size_t line_len = (end == std::string::npos ? headers.size() : end) - start;
-        const std::string line = headers.substr(start, line_len);
-        const std::string lower_line = util::to_lower(line);
-        if (lower_line.rfind(kContentLength, 0) == 0) {
-            const std::string raw = util::trim(line.substr(std::strlen(kContentLength)));
-            if (raw.empty())
-                return 0;
-            try {
-                return static_cast<std::size_t>(std::stoul(raw));
-            } catch (const std::exception&) {
-                return 0;
-            }
+    constexpr std::string_view kContentLength = "content-length:";
+    const std::string lower_headers = util::to_lower(headers);
+
+    std::size_t pos = 0;
+    while ((pos = lower_headers.find(kContentLength, pos)) != std::string::npos) {
+        if (pos != 0 && lower_headers.compare(pos - 2, 2, "\r\n") != 0) {
+            pos += kContentLength.size();
+            continue;
         }
-        if (end == std::string::npos)
-            break;
-        start = end + 2;
+
+        const std::size_t value_start = pos + kContentLength.size();
+        const std::size_t value_end = headers.find("\r\n", value_start);
+        const std::string_view raw(headers.data() + value_start, (value_end == std::string::npos ? headers.size() : value_end) - value_start);
+        const std::string trimmed = util::trim(raw);
+        if (trimmed.empty())
+            return 0;
+
+        std::size_t content_length = 0;
+        const auto [ptr, ec] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), content_length);
+        if (ec == std::errc() && ptr == trimmed.data() + trimmed.size())
+            return content_length;
+        return 0;
     }
+
     return 0;
 }
 
@@ -203,6 +204,29 @@ bool parse_client_ports(const std::string& transport, std::uint16_t& rtp, std::u
     } catch (const std::exception&) {
         return false;
     }
+}
+
+// We only support plain UDP unicast RTP/RTCP via RTP/AVP + client_port=...
+// Multicast and interleaved RTP-over-RTSP/TCP transports are rejected
+bool is_supported_transport(const std::string& transport) {
+    const std::string lower = util::to_lower(transport);
+    const std::size_t first_sep = lower.find(';');
+    const std::string profile = util::trim(lower.substr(0, first_sep));
+    if (profile != "rtp/avp" && profile != "rtp/avp/udp")
+        return false;
+
+    std::size_t start = first_sep == std::string::npos ? lower.size() : first_sep + 1;
+    while (start < lower.size()) {
+        const std::size_t end = lower.find(';', start);
+        const std::string token = util::trim(lower.substr(start, end - start));
+        if (token == "multicast" || token.rfind("interleaved=", 0) == 0)
+            return false;
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+
+    return true;
 }
 
 bool parse_media_relative_path(const std::string& uri, std::filesystem::path& relative_path) {
@@ -403,9 +427,11 @@ void Session::start_write() {
 void Session::handle_write(asio::error_code ec, std::size_t) {
     if (finished_)
         return;
+
     if (ec) {
         if (ec != asio::error::operation_aborted)
             log() << "write failed to " << remote_endpoint_ << ": " << ec.message();
+
         finish();
         return;
     }
@@ -445,10 +471,8 @@ void Session::finish() {
         CloseHandler on_close = std::move(on_close_);
         if (on_close)
             on_close(session_id_, remote_endpoint_);
-    } catch (const std::exception& ex) {
-        log() << "on_close callback threw: " << ex.what();
     } catch (...) {
-        log() << "on_close callback threw unknown exception";
+        log() << "on_close callback threw an exception";
     }
 }
 
@@ -464,16 +488,15 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
     current_media_uri_ = media_uri;
     current_media_ = std::move(media);
 
-    if (current_media_.video.present) {
+    if (current_media_.video.present)
         log() << "selected video codec " << current_media_.video.codec_name;
-    } else {
+    else
         log() << "no supported video track detected";
-    }
-    if (current_media_.audio.present) {
+
+    if (current_media_.audio.present)
         log() << "selected audio codec " << current_media_.audio.codec_name;
-    } else {
+    else
         log() << "no supported audio track detected";
-    }
 
     return true;
 }
@@ -524,6 +547,7 @@ bool Session::start_streaming() {
 void Session::stop_streaming() {
     if (!streamer_)
         return;
+
     streamer_->stop();
     streamer_.reset();
 }
@@ -553,6 +577,8 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
 
 Session::RequestOutcome Session::handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header) {
     if (transport.empty())
+        return make_response(461, "Unsupported Transport", cseq, {}, "");
+    if (!is_supported_transport(transport))
         return make_response(461, "Unsupported Transport", cseq, {}, "");
 
     std::uint16_t parsed_rtp = 0;
@@ -612,10 +638,9 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
     ports->client_rtcp = parsed_rtcp;
     ports->setup = true;
 
-    std::ostringstream transport_reply;
-    transport_reply << "RTP/AVP;unicast;client_port=" << ports->client_rtp << '-' << ports->client_rtcp
-                    << ";server_port=" << ports->server_rtp << '-' << ports->server_rtcp;
-    return make_response(200, "OK", cseq, {{"Session", session_id_text()}, {"Transport", transport_reply.str()}}, "");
+    std::string transport_reply = "RTP/AVP;unicast;client_port=" + std::to_string(ports->client_rtp) + "-" + std::to_string(ports->client_rtcp);
+    transport_reply += ";server_port=" + std::to_string(ports->server_rtp) + "-" + std::to_string(ports->server_rtcp);
+    return make_response(200, "OK", cseq, {{"Session", session_id_text()}, {"Transport", transport_reply}}, "");
 }
 
 Session::RequestOutcome Session::handle_play(const std::string& cseq, const std::string& session_header) {
