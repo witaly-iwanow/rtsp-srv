@@ -58,7 +58,7 @@ public:
     InputFormatContext(const InputFormatContext&) = delete;
     InputFormatContext& operator=(const InputFormatContext&) = delete;
 
-    ~InputFormatContext() {
+    virtual ~InputFormatContext() {
         reset();
     }
 
@@ -84,8 +84,10 @@ public:
     }
 
     void reset() {
-        if (context_ != nullptr)
+        if (context_) {
             avformat_close_input(&context_);
+            context_ = nullptr;
+        }
     }
 
 private:
@@ -98,12 +100,12 @@ public:
     OutputFormatContext(const OutputFormatContext&) = delete;
     OutputFormatContext& operator=(const OutputFormatContext&) = delete;
 
-    ~OutputFormatContext() {
+    virtual ~OutputFormatContext() {
         reset();
     }
 
     void reset() {
-        if (context_ == nullptr)
+        if (!context_)
             return;
 
         if (header_written_)
@@ -132,7 +134,7 @@ public:
         }
 
         stream_ = avformat_new_stream(context_, nullptr);
-        if (stream_ == nullptr) {
+        if (!stream_) {
             error_text = "avformat_new_stream failed";
             reset();
             return false;
@@ -204,14 +206,12 @@ public:
         return packet_;
     }
 
-    void reset() {
-        if (packet_ != nullptr)
-            av_packet_unref(packet_);
+    void unref() {
+        av_packet_unref(packet_);
     }
 
-    ~PacketHandle() {
-        if (packet_ != nullptr)
-            av_packet_free(&packet_);
+    virtual ~PacketHandle() {
+        av_packet_free(&packet_);
     }
 
 private:
@@ -225,7 +225,7 @@ public:
     BitstreamFilterContext(const BitstreamFilterContext&) = delete;
     BitstreamFilterContext& operator=(const BitstreamFilterContext&) = delete;
 
-    ~BitstreamFilterContext() {
+    virtual ~BitstreamFilterContext() {
         reset();
     }
 
@@ -267,8 +267,10 @@ public:
     }
 
     void reset() {
-        if (context_ != nullptr)
+        if (context_) {
             av_bsf_free(&context_);
+            context_ = nullptr;
+        }
     }
 
 private:
@@ -549,12 +551,12 @@ bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, 
         }
 
         if (input_packet.get()->stream_index != stream->index) {
-            input_packet.reset();
+            input_packet.unref();
             continue;
         }
 
         err = av_bsf_send_packet(bsf.get(), input_packet.get());
-        input_packet.reset();
+        input_packet.unref();
         if (err < 0) {
             error_text = "av_bsf_send_packet failed: " + ffmpeg_error_text(err);
             return false;
@@ -575,7 +577,7 @@ bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, 
                 return copy_codec_extradata(
                     stream->codecpar, side_data, static_cast<int>(side_data_size), error_text);
             }
-            filtered_packet.reset();
+            filtered_packet.unref();
         }
 
         if (bsf.get()->par_out != nullptr && bsf.get()->par_out->extradata_size > 0)
@@ -856,7 +858,7 @@ void MediaStreamer::schedule_next_packet() {
             output = &impl_->audio;
 
         if (output == nullptr) {
-            impl_->packet.reset();
+            impl_->packet.unref();
             continue;
         }
 
@@ -884,7 +886,7 @@ void MediaStreamer::schedule_next_packet() {
         keep_timestamps_monotonic(current, *output);
         current->stream_index = 0;
         err = av_interleaved_write_frame(output->output.get(), current);
-        impl_->packet.reset();
+        impl_->packet.unref();
         if (err < 0) {
             LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
             finalize();
@@ -923,14 +925,14 @@ void MediaStreamer::handle_timer(asio::error_code ec) {
         keep_timestamps_monotonic(current, *output);
         current->stream_index = 0;
         const int err = av_interleaved_write_frame(output->output.get(), current);
-        impl_->packet.reset();
+        impl_->packet.unref();
         if (err < 0) {
             LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
             finalize();
             return;
         }
     } else {
-        impl_->packet.reset();
+        impl_->packet.unref();
     }
 
     schedule_next_packet();
@@ -943,7 +945,7 @@ void MediaStreamer::finalize() {
     impl_->video.reset();
     impl_->audio.reset();
     impl_->input.reset();
-    impl_->packet.reset();
+    impl_->packet.unref();
 
     {
         const std::lock_guard<std::mutex> lock(impl_->state_mutex);

@@ -84,7 +84,7 @@ bool RtspServer::open_acceptor() {
     }
 
     if (is_loopback_host(host_))
-        LOG << "Binding to loopback only (" << host_ << "). Remote clients will not connect; feel free to shoot yourself in the foot.";
+        LOG << "Binding to loopback only (" << host_ << "). Remote clients will not be able to connect.";
 
     asio::error_code ec;
     for (const tcp::endpoint& endpoint: endpoints) {
