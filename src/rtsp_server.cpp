@@ -44,10 +44,7 @@ std::string endpoint_to_string(const tcp::endpoint& endpoint) {
     return host + ":" + std::to_string(endpoint.port());
 }
 
-std::vector<tcp::endpoint> resolve_bind_endpoints(
-    asio::io_context& io_context,
-    const std::string& host,
-    const std::string& service) {
+std::vector<tcp::endpoint> resolve_bind_endpoints(asio::io_context& io_context, const std::string& host, const std::string& service) {
     tcp::resolver resolver(io_context);
     asio::error_code ec;
     const std::string node = is_wildcard_host(host) ? "" : host;

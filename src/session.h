@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+// Handles one RTSP client connection: parses requests, manages media setup,
+// and owns the MediaStreamer that pushes RTP packets to the client.
 class Session : public std::enable_shared_from_this<Session> {
 public:
     using Ptr = std::shared_ptr<Session>;
@@ -21,13 +23,7 @@ public:
     using MediaExecutor = asio::any_io_executor;
     using CloseHandler = std::function<void(std::uint32_t, const std::string&)>;
 
-    Session(
-        Socket socket,
-        std::string remote_endpoint,
-        const std::filesystem::path& media_dir,
-        MediaExecutor media_executor,
-        std::uint32_t session_id,
-        CloseHandler on_close);
+    Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, CloseHandler on_close);
 
     ~Session();
 
@@ -41,6 +37,7 @@ public:
     Session& operator=(const Session&) = delete;
 
 private:
+    // Per-track port assignments negotiated during SETUP.
     struct TrackPorts {
         std::uint16_t client_rtp = 0;
         std::uint16_t client_rtcp = 0;
@@ -49,6 +46,7 @@ private:
         bool setup = false;
     };
 
+    // Result of processing one RTSP request: the response text and whether to close the connection.
     struct RequestOutcome {
         std::string response;
         bool close_after_response = false;
@@ -75,11 +73,7 @@ private:
     RequestOutcome handle_request(const std::string& raw_request);
     RequestOutcome handle_options(const std::string& cseq) const;
     RequestOutcome handle_describe(const std::string& uri, const std::string& cseq);
-    RequestOutcome handle_setup(
-        const std::string& uri,
-        const std::string& cseq,
-        const std::string& transport,
-        const std::string& session_header);
+    RequestOutcome handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header);
     RequestOutcome handle_play(const std::string& cseq, const std::string& session_header);
     RequestOutcome handle_teardown(const std::string& cseq);
     std::string log_prefix() const;

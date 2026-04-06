@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+// Describes one track (video or audio) found in a media file.
 struct MediaTrack {
     bool present = false;
     int channels = 0;
@@ -15,12 +16,14 @@ struct MediaTrack {
     std::string codec_name;
 };
 
+// Full media description with video/audio tracks and a generated SDP for the client.
 struct MediaDescription {
     MediaTrack video;
     MediaTrack audio;
     std::string sdp;
 };
 
+// Destination addresses and ports for one RTP track sent to a client.
 struct StreamTarget {
     bool enabled = false;
     std::string host;
@@ -32,6 +35,8 @@ struct StreamTarget {
 
 bool describe_media(const std::filesystem::path& media_path, MediaDescription& media);
 
+// Inspects a media file and streams selected tracks over RTP using FFmpeg's RTP muxer.
+// Runs on a dedicated executor (strand) so the calling RTSP thread is not blocked after startup.
 class MediaStreamer {
 public:
     MediaStreamer(

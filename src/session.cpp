@@ -259,13 +259,7 @@ std::string endpoint_host(const std::string& endpoint) {
 
 }  // namespace
 
-Session::Session(
-    Socket socket,
-    std::string remote_endpoint,
-    const std::filesystem::path& media_dir,
-    MediaExecutor media_executor,
-    std::uint32_t session_id,
-    CloseHandler on_close):
+Session::Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, CloseHandler on_close):
     socket_(std::move(socket)),
     remote_endpoint_(std::move(remote_endpoint)),
     media_dir_(media_dir),
@@ -294,13 +288,7 @@ void Session::shutdown() {
         return;
 
     stop_streaming();
-    queue_response(make_response(
-        503,
-        "Service Unavailable",
-        "0",
-        {{"Connection", "close"}, {"Reason", "server shutting down"}},
-        "",
-        true));
+    queue_response(make_response(503, "Service Unavailable", "0", {{"Connection", "close"}, {"Reason", "server shutting down"}}, "", true));
 }
 
 const std::string& Session::remote_endpoint() const {
@@ -525,14 +513,7 @@ bool Session::start_streaming() {
         audio_target.server_rtcp = audio_ports_.server_rtcp;
     }
 
-    auto streamer = std::make_unique<MediaStreamer>(
-        media_executor_,
-        current_media_path_,
-        current_media_,
-        video_target,
-        audio_target,
-        make_rtp_cname(session_id_),
-        log_prefix());
+    auto streamer = std::make_unique<MediaStreamer>(media_executor_, current_media_path_, current_media_, video_target, audio_target, make_rtp_cname(session_id_), log_prefix());
     if (!streamer->start())
         return false;
 
@@ -567,19 +548,10 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
     std::string base = current_media_uri_;
     if (!base.empty() && base.back() != '/')
         base += '/';
-    return make_response(
-        200,
-        "OK",
-        cseq,
-        {{"Content-Base", base}, {"Content-Type", "application/sdp"}},
-        current_media_.sdp);
+    return make_response(200, "OK", cseq, {{"Content-Base", base}, {"Content-Type", "application/sdp"}}, current_media_.sdp);
 }
 
-Session::RequestOutcome Session::handle_setup(
-    const std::string& uri,
-    const std::string& cseq,
-    const std::string& transport,
-    const std::string& session_header) {
+Session::RequestOutcome Session::handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header) {
     if (transport.empty())
         return make_response(461, "Unsupported Transport", cseq, {}, "");
 
@@ -643,12 +615,7 @@ Session::RequestOutcome Session::handle_setup(
     std::ostringstream transport_reply;
     transport_reply << "RTP/AVP;unicast;client_port=" << ports->client_rtp << '-' << ports->client_rtcp
                     << ";server_port=" << ports->server_rtp << '-' << ports->server_rtcp;
-    return make_response(
-        200,
-        "OK",
-        cseq,
-        {{"Session", session_id_text()}, {"Transport", transport_reply.str()}},
-        "");
+    return make_response(200, "OK", cseq, {{"Session", session_id_text()}, {"Transport", transport_reply.str()}}, "");
 }
 
 Session::RequestOutcome Session::handle_play(const std::string& cseq, const std::string& session_header) {

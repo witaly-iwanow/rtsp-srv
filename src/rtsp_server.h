@@ -10,6 +10,8 @@
 #include <string>
 #include <unordered_map>
 
+// Entry point for the RTSP server. Accepts TCP connections, dispatches sessions,
+// and manages the media thread pool.
 class RtspServer {
 public:
     RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service, std::size_t media_threads = 0);

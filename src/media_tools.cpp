@@ -52,6 +52,7 @@ void ensure_network_initialized() {
     static_cast<void>(kInitOnce);
 }
 
+// RAII wrapper around AVFormatContext for reading input files.
 class InputFormatContext {
 public:
     InputFormatContext() = default;
@@ -94,6 +95,7 @@ private:
     AVFormatContext* context_ = nullptr;
 };
 
+// RAII wrapper around an AVFormatContext used as an RTP output muxer.
 class OutputFormatContext {
 public:
     OutputFormatContext() = default;
@@ -119,13 +121,7 @@ public:
         header_written_ = false;
     }
 
-    bool init(
-        const std::string& url,
-        AVStream* input_stream,
-        const std::string& rtp_cname,
-        bool open_io,
-        int payload_type,
-        std::string& error_text) {
+    bool init(const std::string& url, AVStream* input_stream, const std::string& rtp_cname, bool open_io, int payload_type, std::string& error_text) {
         reset();
         int err = avformat_alloc_output_context2(&context_, nullptr, "rtp", url.c_str());
         if (err < 0 || context_ == nullptr) {
@@ -196,6 +192,7 @@ private:
     bool header_written_ = false;
 };
 
+// RAII wrapper around AVPacket that allocates the packet once and unrefs it between uses.
 class PacketHandle {
 public:
     PacketHandle(): packet_(av_packet_alloc()) {}
@@ -277,6 +274,7 @@ private:
     AVBSFContext* context_ = nullptr;
 };
 
+// Tracks per-track state for continuous looping: output muxer and timestamp remap offsets.
 struct ActiveTrack {
     int input_index = -1;
     OutputFormatContext output;
@@ -443,11 +441,7 @@ bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) 
     return true;
 }
 
-bool build_sdp(
-    AVFormatContext* input,
-    MediaDescription& media,
-    std::string& sdp_out,
-    std::string& error_text) {
+bool build_sdp(AVFormatContext* input, MediaDescription& media, std::string& sdp_out, std::string& error_text) {
     std::vector<std::unique_ptr<OutputFormatContext>> outputs;
     std::vector<AVFormatContext*> contexts;
 
@@ -465,13 +459,7 @@ bool build_sdp(
         target.server_rtcp = static_cast<std::uint16_t>(port + 1);
 
         auto output = std::make_unique<OutputFormatContext>();
-        if (!output->init(
-                make_rtp_url(target),
-                input->streams[track.stream_index],
-                "rtsp-sdp",
-                false,
-                -1,
-                error_text))
+        if (!output->init(make_rtp_url(target), input->streams[track.stream_index], "rtsp-sdp", false, -1, error_text))
             return false;
 
         contexts.push_back(output->get());
@@ -571,21 +559,15 @@ bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, 
                 return false;
             }
             std::size_t side_data_size = 0;
-            const std::uint8_t* side_data = av_packet_get_side_data(
-                filtered_packet.get(), AV_PKT_DATA_NEW_EXTRADATA, &side_data_size);
+            const std::uint8_t* side_data = av_packet_get_side_data(filtered_packet.get(), AV_PKT_DATA_NEW_EXTRADATA, &side_data_size);
             if (side_data != nullptr && side_data_size > 0) {
-                return copy_codec_extradata(
-                    stream->codecpar, side_data, static_cast<int>(side_data_size), error_text);
+                return copy_codec_extradata(stream->codecpar, side_data, static_cast<int>(side_data_size), error_text);
             }
             filtered_packet.unref();
         }
 
         if (bsf.get()->par_out != nullptr && bsf.get()->par_out->extradata_size > 0)
-            return copy_codec_extradata(
-                stream->codecpar,
-                bsf.get()->par_out->extradata,
-                bsf.get()->par_out->extradata_size,
-                error_text);
+            return copy_codec_extradata(stream->codecpar, bsf.get()->par_out->extradata, bsf.get()->par_out->extradata_size, error_text);
     }
 }
 
@@ -626,8 +608,7 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
         return false;
     }
 
-    if (media.audio.present
-        && !derive_aac_audio_specific_config(input.get(), input.get()->streams[media.audio.stream_index], error_text)) {
+    if (media.audio.present && !derive_aac_audio_specific_config(input.get(), input.get()->streams[media.audio.stream_index], error_text)) {
         LOG << "Failed to derive AAC AudioSpecificConfig for " << media_path << ": " << error_text;
         return false;
     }
@@ -767,9 +748,7 @@ void MediaStreamer::start_on_executor() {
         return;
     }
 
-    if (impl_->audio_target.enabled
-        && !derive_aac_audio_specific_config(
-            impl_->input.get(), impl_->input.get()->streams[impl_->media.audio.stream_index], error_text)) {
+    if (impl_->audio_target.enabled && !derive_aac_audio_specific_config(impl_->input.get(), impl_->input.get()->streams[impl_->media.audio.stream_index], error_text)) {
         complete_startup(false, std::move(error_text));
         finalize();
         return;
@@ -782,13 +761,7 @@ void MediaStreamer::start_on_executor() {
 
     if (impl_->video_target.enabled) {
         impl_->video.input_index = impl_->media.video.stream_index;
-        if (!impl_->video.output.init(
-                make_rtp_url(impl_->video_target),
-                impl_->input.get()->streams[impl_->video.input_index],
-                impl_->rtp_cname,
-                true,
-                impl_->media.video.rtp_payload_type,
-                error_text)) {
+        if (!impl_->video.output.init(make_rtp_url(impl_->video_target), impl_->input.get()->streams[impl_->video.input_index], impl_->rtp_cname, true, impl_->media.video.rtp_payload_type, error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
@@ -797,13 +770,7 @@ void MediaStreamer::start_on_executor() {
 
     if (impl_->audio_target.enabled) {
         impl_->audio.input_index = impl_->media.audio.stream_index;
-        if (!impl_->audio.output.init(
-                make_rtp_url(impl_->audio_target),
-                impl_->input.get()->streams[impl_->audio.input_index],
-                impl_->rtp_cname,
-                true,
-                impl_->media.audio.rtp_payload_type,
-                error_text)) {
+        if (!impl_->audio.output.init(make_rtp_url(impl_->audio_target), impl_->input.get()->streams[impl_->audio.input_index], impl_->rtp_cname, true, impl_->media.audio.rtp_payload_type, error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
