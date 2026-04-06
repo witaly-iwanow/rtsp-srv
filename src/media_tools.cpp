@@ -207,7 +207,8 @@ public:
     }
 
     void unref() {
-        av_packet_unref(packet_);
+        if (packet_ != nullptr)
+            av_packet_unref(packet_);
     }
 
     virtual ~PacketHandle() {
@@ -630,8 +631,19 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
     return true;
 }
 
-struct MediaStreamer::Impl {
+struct MediaStreamer::Impl : public std::enable_shared_from_this<MediaStreamer::Impl> {
     explicit Impl(asio::any_io_executor executor): strand(asio::make_strand(std::move(executor))), timer(strand) {}
+
+    bool start();
+    void stop();
+    bool running_now() const;
+    Logger::Entry log() const;
+    void complete_startup(bool ok, std::string error_text = {});
+    void start_on_executor();
+    bool handle_eof_rewind();
+    void schedule_next_packet();
+    void handle_timer(asio::error_code ec);
+    void finalize();
 
     asio::strand<asio::any_io_executor> strand;
     asio::steady_timer timer;
@@ -691,7 +703,7 @@ MediaStreamer::MediaStreamer(
     StreamTarget audio_target,
     std::string rtp_cname,
     std::string log_prefix):
-    impl_(std::make_unique<Impl>(std::move(executor))) {
+    impl_(std::make_shared<Impl>(std::move(executor))) {
     impl_->media_path = std::move(media_path);
     impl_->media = std::move(media);
     impl_->video_target = std::move(video_target);
@@ -705,234 +717,255 @@ MediaStreamer::~MediaStreamer() {
 }
 
 bool MediaStreamer::start() {
-    if (impl_->running.load())
-        return running();
-
-    {
-        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-        impl_->stop_requested = false;
-        impl_->startup_done = false;
-        impl_->startup_ok = false;
-        impl_->startup_reported = false;
-        impl_->stop_done = false;
-        impl_->startup_error.clear();
-    }
-    impl_->running.store(false);
-    asio::post(impl_->strand, [this]() {
-        start_on_executor();
-    });
-
-    std::unique_lock<std::mutex> lock(impl_->state_mutex);
-    impl_->state_cv.wait(lock, [this]() {
-        return impl_->startup_done;
-    });
-
-    if (impl_->startup_ok)
-        return true;
-
-    if (!impl_->startup_error.empty())
-        LOG << impl_->log_prefix << " media pipeline startup failed: " << impl_->startup_error;
-    return false;
+    return impl_->start();
 }
 
 void MediaStreamer::stop() {
-    {
-        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-        if (impl_->stop_done)
-            return;
-        impl_->stop_requested = true;
-    }
-    asio::post(impl_->strand, [this]() {
-        impl_->timer.cancel();
-        finalize();
-    });
-
-    std::unique_lock<std::mutex> lock(impl_->state_mutex);
-    impl_->state_cv.wait(lock, [this]() {
-        return impl_->stop_done;
-    });
+    impl_->stop();
 }
 
 bool MediaStreamer::running() const {
-    return impl_->running.load();
+    return impl_->running_now();
 }
 
-void MediaStreamer::complete_startup(bool ok, std::string error_text) {
+bool MediaStreamer::Impl::start() {
+    if (running.load())
+        return running_now();
+
     {
-        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-        if (impl_->startup_reported)
-            return;
-        impl_->startup_done = true;
-        impl_->startup_ok = ok;
-        impl_->startup_reported = true;
-        impl_->startup_error = std::move(error_text);
+        const std::lock_guard<std::mutex> lock(state_mutex);
+        stop_requested = false;
+        startup_done = false;
+        startup_ok = false;
+        startup_reported = false;
+        stop_done = false;
+        startup_error.clear();
     }
-    impl_->state_cv.notify_all();
+    running.store(false);
+
+    auto self = shared_from_this();
+    asio::post(strand, [self]() {
+        self->start_on_executor();
+    });
+
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_cv.wait(lock, [this]() {
+        return startup_done;
+    });
+
+    if (startup_ok)
+        return true;
+
+    if (!startup_error.empty())
+        log() << " media pipeline startup failed: " << startup_error;
+    return false;
 }
 
-void MediaStreamer::start_on_executor() {
+void MediaStreamer::Impl::stop() {
+    {
+        const std::lock_guard<std::mutex> lock(state_mutex);
+        if (stop_done)
+            return;
+        stop_requested = true;
+    }
+
+    timer.cancel();
+    auto self = shared_from_this();
+    asio::post(strand, [self]() {
+        self->finalize();
+    });
+
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_cv.wait(lock, [this]() {
+        return stop_done;
+    });
+}
+
+bool MediaStreamer::Impl::running_now() const {
+    return running.load();
+}
+
+Logger::Entry MediaStreamer::Impl::log() const {
+    return Logger::Entry(Logger::instance(), log_prefix);
+}
+
+void MediaStreamer::Impl::complete_startup(bool ok, std::string error_text) {
+    {
+        const std::lock_guard<std::mutex> lock(state_mutex);
+        if (startup_reported)
+            return;
+        startup_done = true;
+        startup_ok = ok;
+        startup_reported = true;
+        startup_error = std::move(error_text);
+    }
+    state_cv.notify_all();
+}
+
+void MediaStreamer::Impl::start_on_executor() {
     std::string error_text;
-    if (!impl_->input.open(impl_->media_path, error_text)) {
+    if (!input.open(media_path, error_text)) {
         complete_startup(false, std::move(error_text));
         finalize();
         return;
     }
 
-    if (impl_->audio_target.enabled && !derive_aac_audio_specific_config(impl_->input.get(), impl_->input.get()->streams[impl_->media.audio.stream_index], error_text)) {
+    if (audio_target.enabled && !derive_aac_audio_specific_config(input.get(), input.get()->streams[media.audio.stream_index], error_text)) {
         complete_startup(false, std::move(error_text));
         finalize();
         return;
     }
-    if (!rewind_input(impl_->input.get(), error_text)) {
+    if (!rewind_input(input.get(), error_text)) {
         complete_startup(false, std::move(error_text));
         finalize();
         return;
     }
 
-    if (impl_->video_target.enabled) {
-        impl_->video.input_index = impl_->media.video.stream_index;
-        if (!impl_->video.output.init(make_rtp_url(impl_->video_target), impl_->input.get()->streams[impl_->video.input_index], impl_->rtp_cname, true, impl_->media.video.rtp_payload_type, error_text)) {
+    if (video_target.enabled) {
+        video.input_index = media.video.stream_index;
+        if (!video.output.init(make_rtp_url(video_target), input.get()->streams[video.input_index], rtp_cname, true, media.video.rtp_payload_type, error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
         }
     }
 
-    if (impl_->audio_target.enabled) {
-        impl_->audio.input_index = impl_->media.audio.stream_index;
-        if (!impl_->audio.output.init(make_rtp_url(impl_->audio_target), impl_->input.get()->streams[impl_->audio.input_index], impl_->rtp_cname, true, impl_->media.audio.rtp_payload_type, error_text)) {
+    if (audio_target.enabled) {
+        audio.input_index = media.audio.stream_index;
+        if (!audio.output.init(make_rtp_url(audio_target), input.get()->streams[audio.input_index], rtp_cname, true, media.audio.rtp_payload_type, error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
         }
     }
 
-    if (impl_->packet.get() == nullptr) {
+    if (packet.get() == nullptr) {
         complete_startup(false, "av_packet_alloc failed");
         finalize();
         return;
     }
 
-    impl_->running.store(true);
-    impl_->wall_start_us = AV_NOPTS_VALUE;
-    impl_->media_start_us = AV_NOPTS_VALUE;
+    running.store(true);
+    wall_start_us = AV_NOPTS_VALUE;
+    media_start_us = AV_NOPTS_VALUE;
     complete_startup(true);
     schedule_next_packet();
 }
 
-bool MediaStreamer::handle_eof_rewind() {
+bool MediaStreamer::Impl::handle_eof_rewind() {
     std::string error_text;
-    if (!rewind_input(impl_->input.get(), error_text)) {
-        LOG << impl_->log_prefix << " rewind failed: " << error_text;
+    if (!rewind_input(input.get(), error_text)) {
+        log() << " rewind failed: " << error_text;
         finalize();
         return false;
     }
-    impl_->video.start_next_loop();
-    impl_->audio.start_next_loop();
-    impl_->wall_start_us = AV_NOPTS_VALUE;
-    impl_->media_start_us = AV_NOPTS_VALUE;
+    video.start_next_loop();
+    audio.start_next_loop();
+    wall_start_us = AV_NOPTS_VALUE;
+    media_start_us = AV_NOPTS_VALUE;
     return true;
 }
 
-void MediaStreamer::schedule_next_packet() {
-    if (impl_->stop_requested) {
+void MediaStreamer::Impl::schedule_next_packet() {
+    if (stop_requested) {
         finalize();
         return;
     }
 
-    while (!impl_->stop_requested) {
-        AVPacket* current = impl_->packet.get();
-        int err = av_read_frame(impl_->input.get(), current);
+    while (!stop_requested) {
+        AVPacket* current = packet.get();
+        int err = av_read_frame(input.get(), current);
         if (err == AVERROR_EOF) {
             if (!handle_eof_rewind())
                 return;
             continue;
         }
         if (err < 0) {
-            LOG << impl_->log_prefix << " av_read_frame failed: " << ffmpeg_error_text(err);
+            log() << " av_read_frame failed: " << ffmpeg_error_text(err);
             finalize();
             return;
         }
 
-        ActiveTrack* output = select_output_track(impl_->video_target, impl_->video, impl_->audio_target, impl_->audio, current->stream_index);
+        ActiveTrack* output = select_output_track(video_target, video, audio_target, audio, current->stream_index);
         if (output == nullptr) {
-            impl_->packet.unref();
+            packet.unref();
             continue;
         }
 
-        AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
+        AVStream* input_stream = input.get()->streams[current->stream_index];
         const std::int64_t ts = current->pts != AV_NOPTS_VALUE ? current->pts : current->dts;
         if (ts != AV_NOPTS_VALUE) {
             const std::int64_t packet_time_us = av_rescale_q(ts, input_stream->time_base, AV_TIME_BASE_Q);
-            if (impl_->media_start_us == AV_NOPTS_VALUE) {
-                impl_->media_start_us = packet_time_us;
-                impl_->wall_start_us = av_gettime_relative();
+            if (media_start_us == AV_NOPTS_VALUE) {
+                media_start_us = packet_time_us;
+                wall_start_us = av_gettime_relative();
             }
 
-            const std::int64_t target_time_us = impl_->wall_start_us + (packet_time_us - impl_->media_start_us);
+            const std::int64_t target_time_us = wall_start_us + (packet_time_us - media_start_us);
             const std::int64_t delay_us = target_time_us - av_gettime_relative();
             if (delay_us > 0) {
-                impl_->timer.expires_after(std::chrono::microseconds(delay_us));
-                impl_->timer.async_wait(asio::bind_executor(impl_->strand, [this](asio::error_code ec) {
-                    handle_timer(ec);
+                timer.expires_after(std::chrono::microseconds(delay_us));
+                auto self = shared_from_this();
+                timer.async_wait(asio::bind_executor(strand, [self](asio::error_code ec) {
+                    self->handle_timer(ec);
                 }));
                 return;
             }
         }
 
         if (!write_packet(current, input_stream, *output)) {
-            LOG << impl_->log_prefix << " av_interleaved_write_frame failed";
+            log() << " av_interleaved_write_frame failed";
             finalize();
             return;
         }
     }
 }
 
-void MediaStreamer::handle_timer(asio::error_code ec) {
-    if (ec == asio::error::operation_aborted || impl_->stop_requested) {
-        if (impl_->stop_requested)
+void MediaStreamer::Impl::handle_timer(asio::error_code ec) {
+    if (ec == asio::error::operation_aborted || stop_requested) {
+        if (stop_requested)
             finalize();
         return;
     }
     if (ec) {
-        LOG << impl_->log_prefix << " timer failed: " << ec.message();
+        log() << " timer failed: " << ec.message();
         finalize();
         return;
     }
 
-    AVPacket* current = impl_->packet.get();
-    ActiveTrack* output = select_output_track(impl_->video_target, impl_->video, impl_->audio_target, impl_->audio, current->stream_index);
+    AVPacket* current = packet.get();
+    ActiveTrack* output = select_output_track(video_target, video, audio_target, audio, current->stream_index);
     if (output != nullptr) {
-        AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
+        AVStream* input_stream = input.get()->streams[current->stream_index];
         if (!write_packet(current, input_stream, *output)) {
-            LOG << impl_->log_prefix << " av_interleaved_write_frame failed";
+            log() << " av_interleaved_write_frame failed";
             finalize();
             return;
         }
     } else {
-        impl_->packet.unref();
+        packet.unref();
     }
 
     schedule_next_packet();
 }
 
-void MediaStreamer::finalize() {
-    if (impl_->running.exchange(false)) {
-        impl_->timer.cancel();
+void MediaStreamer::Impl::finalize() {
+    if (running.exchange(false)) {
+        timer.cancel();
     }
-    impl_->video.reset();
-    impl_->audio.reset();
-    impl_->input.reset();
-    impl_->packet.unref();
+    video.reset();
+    audio.reset();
+    input.reset();
+    packet.unref();
 
     {
-        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-        impl_->stop_done = true;
-        if (!impl_->startup_reported) {
-            impl_->startup_done = true;
-            impl_->startup_ok = false;
-            impl_->startup_reported = true;
+        const std::lock_guard<std::mutex> lock(state_mutex);
+        stop_done = true;
+        if (!startup_reported) {
+            startup_done = true;
+            startup_ok = false;
+            startup_reported = true;
         }
     }
-    impl_->state_cv.notify_all();
+    state_cv.notify_all();
 }
