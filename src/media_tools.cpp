@@ -142,8 +142,10 @@ public:
             reset();
             return false;
         }
+        // make sure it's not auto (-1) or such
         if (payload_type >= 0 && payload_type <= 127)
             stream_->id = payload_type;
+
         stream_->codecpar->codec_tag = 0;
         stream_->time_base = input_stream->time_base;
         stream_->avg_frame_rate = input_stream->avg_frame_rate;
@@ -164,6 +166,7 @@ public:
         av_dict_set(&options, "cname", rtp_cname.c_str(), 0);
         std::string payload_type_text;
         if (payload_type >= 96 && payload_type <= 127) {
+            // dynamic range
             payload_type_text = std::to_string(payload_type);
             av_dict_set(&options, "payload_type", payload_type_text.c_str(), 0);
         }
@@ -293,10 +296,12 @@ struct ActiveTrack {
     void start_next_loop() {
         if (last_output_end_ts != AV_NOPTS_VALUE)
             loop_output_offset_ts = last_output_end_ts;
+
         loop_input_start_ts = AV_NOPTS_VALUE;
     }
 };
 
+// Remaps packet timestamps to a monotonically increasing timeline across loops.
 void keep_timestamps_monotonic(AVPacket* packet, ActiveTrack& track) {
     const std::int64_t source_ts = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
     if (track.loop_input_start_ts == AV_NOPTS_VALUE && source_ts != AV_NOPTS_VALUE)
@@ -305,6 +310,7 @@ void keep_timestamps_monotonic(AVPacket* packet, ActiveTrack& track) {
     auto remap = [&](std::int64_t ts) {
         if (ts == AV_NOPTS_VALUE)
             return ts;
+
         const std::int64_t base = track.loop_input_start_ts == AV_NOPTS_VALUE ? ts : track.loop_input_start_ts;
         return ts - base + track.loop_output_offset_ts;
     };
@@ -322,17 +328,14 @@ void keep_timestamps_monotonic(AVPacket* packet, ActiveTrack& track) {
 }
 
 std::string make_rtp_url(const StreamTarget& target) {
-    std::ostringstream url;
-    if (target.host.find(':') != std::string::npos) {
-        url << "rtp://[" << target.host << "]:" << target.client_rtp;
-    } else {
-        url << "rtp://" << target.host << ":" << target.client_rtp;
-    }
-    url << "?pkt_size=1200"
-        << "&rtcpport=" << target.client_rtcp
-        << "&localrtpport=" << target.server_rtp
-        << "&localrtcpport=" << target.server_rtcp;
-    return url.str();
+    auto host = target.host;
+    // surround with brackets if it contains colons (IPv6)
+    if (host.find(':') != std::string::npos)
+        host = "[" + host + "]";
+    return "rtp://" + host + ":" + std::to_string(target.client_rtp)
+        + "?pkt_size=1200&rtcpport=" + std::to_string(target.client_rtcp)
+        + "&localrtpport=" + std::to_string(target.server_rtp)
+        + "&localrtcpport=" + std::to_string(target.server_rtcp);
 }
 
 std::string normalize_sdp(const std::string& raw_sdp) {
@@ -346,6 +349,7 @@ std::string normalize_sdp(const std::string& raw_sdp) {
             continue;
         if (line.rfind("a=control:", 0) == 0)
             continue;
+
         cleaned.push_back(line);
     }
 
@@ -364,6 +368,7 @@ std::string normalize_sdp(const std::string& raw_sdp) {
         if (cleaned_line.rfind("m=", 0) == 0) {
             if (track_id >= 0)
                 normalized.emplace_back("a=control:trackID=" + std::to_string(track_id));
+
             ++track_id;
         } else if (cleaned_line.rfind("t=", 0) == 0) {
             has_time = true;
@@ -386,10 +391,10 @@ std::string normalize_sdp(const std::string& raw_sdp) {
     if (track_id >= 0)
         normalized.emplace_back("a=control:trackID=" + std::to_string(track_id));
 
-    std::ostringstream sdp;
+    std::string sdp;
     for (const std::string& normalized_line: normalized)
-        sdp << normalized_line << "\r\n";
-    return sdp.str();
+        sdp += normalized_line + "\r\n";
+    return sdp;
 }
 
 void remember_payload_types_from_sdp(const std::string& sdp, MediaDescription& media) {
@@ -653,6 +658,31 @@ struct MediaStreamer::Impl {
     std::int64_t media_start_us = AV_NOPTS_VALUE;
 };
 
+// Selects the active output track for a packet's stream index, or nullptr if the track is not being streamed.
+static ActiveTrack* select_output_track(
+    const StreamTarget& video_target, const ActiveTrack& video,
+    const StreamTarget& audio_target, const ActiveTrack& audio,
+    int stream_index) {
+    if (video_target.enabled && stream_index == video.input_index)
+        return const_cast<ActiveTrack*>(&video);
+    if (audio_target.enabled && stream_index == audio.input_index)
+        return const_cast<ActiveTrack*>(&audio);
+    return nullptr;
+}
+
+// Rescales timestamps, keeps them monotonic, writes the packet to the RTP muxer, and unrefs it.
+static bool write_packet(AVPacket* packet, AVStream* input_stream, ActiveTrack& output) {
+    av_packet_rescale_ts(packet, input_stream->time_base, output.output.stream()->time_base);
+    keep_timestamps_monotonic(packet, output);
+    packet->stream_index = 0;
+    const int err = av_interleaved_write_frame(output.output.get(), packet);
+    av_packet_unref(packet);
+    if (err < 0)
+        return false;
+
+    return true;
+}
+
 MediaStreamer::MediaStreamer(
     asio::any_io_executor executor,
     std::filesystem::path media_path,
@@ -790,6 +820,20 @@ void MediaStreamer::start_on_executor() {
     schedule_next_packet();
 }
 
+bool MediaStreamer::handle_eof_rewind() {
+    std::string error_text;
+    if (!rewind_input(impl_->input.get(), error_text)) {
+        LOG << impl_->log_prefix << " rewind failed: " << error_text;
+        finalize();
+        return false;
+    }
+    impl_->video.start_next_loop();
+    impl_->audio.start_next_loop();
+    impl_->wall_start_us = AV_NOPTS_VALUE;
+    impl_->media_start_us = AV_NOPTS_VALUE;
+    return true;
+}
+
 void MediaStreamer::schedule_next_packet() {
     if (impl_->stop_requested) {
         finalize();
@@ -800,16 +844,8 @@ void MediaStreamer::schedule_next_packet() {
         AVPacket* current = impl_->packet.get();
         int err = av_read_frame(impl_->input.get(), current);
         if (err == AVERROR_EOF) {
-            std::string error_text;
-            if (!rewind_input(impl_->input.get(), error_text)) {
-                LOG << impl_->log_prefix << " rewind failed: " << error_text;
-                finalize();
+            if (!handle_eof_rewind())
                 return;
-            }
-            impl_->video.start_next_loop();
-            impl_->audio.start_next_loop();
-            impl_->wall_start_us = AV_NOPTS_VALUE;
-            impl_->media_start_us = AV_NOPTS_VALUE;
             continue;
         }
         if (err < 0) {
@@ -818,12 +854,7 @@ void MediaStreamer::schedule_next_packet() {
             return;
         }
 
-        ActiveTrack* output = nullptr;
-        if (impl_->video_target.enabled && current->stream_index == impl_->video.input_index)
-            output = &impl_->video;
-        else if (impl_->audio_target.enabled && current->stream_index == impl_->audio.input_index)
-            output = &impl_->audio;
-
+        ActiveTrack* output = select_output_track(impl_->video_target, impl_->video, impl_->audio_target, impl_->audio, current->stream_index);
         if (output == nullptr) {
             impl_->packet.unref();
             continue;
@@ -849,21 +880,15 @@ void MediaStreamer::schedule_next_packet() {
             }
         }
 
-        av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
-        keep_timestamps_monotonic(current, *output);
-        current->stream_index = 0;
-        err = av_interleaved_write_frame(output->output.get(), current);
-        impl_->packet.unref();
-        if (err < 0) {
-            LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
+        if (!write_packet(current, input_stream, *output)) {
+            LOG << impl_->log_prefix << " av_interleaved_write_frame failed";
             finalize();
-            return;
         }
     }
 }
 
 void MediaStreamer::handle_timer(asio::error_code ec) {
-    if (ec == asio::error::operation_aborted) {
+    if (ec == asio::error::operation_aborted || impl_->stop_requested) {
         if (impl_->stop_requested)
             finalize();
         return;
@@ -874,27 +899,12 @@ void MediaStreamer::handle_timer(asio::error_code ec) {
         return;
     }
 
-    if (impl_->stop_requested) {
-        finalize();
-        return;
-    }
-
     AVPacket* current = impl_->packet.get();
-    ActiveTrack* output = nullptr;
-    if (impl_->video_target.enabled && current->stream_index == impl_->video.input_index)
-        output = &impl_->video;
-    else if (impl_->audio_target.enabled && current->stream_index == impl_->audio.input_index)
-        output = &impl_->audio;
-
+    ActiveTrack* output = select_output_track(impl_->video_target, impl_->video, impl_->audio_target, impl_->audio, current->stream_index);
     if (output != nullptr) {
         AVStream* input_stream = impl_->input.get()->streams[current->stream_index];
-        av_packet_rescale_ts(current, input_stream->time_base, output->output.stream()->time_base);
-        keep_timestamps_monotonic(current, *output);
-        current->stream_index = 0;
-        const int err = av_interleaved_write_frame(output->output.get(), current);
-        impl_->packet.unref();
-        if (err < 0) {
-            LOG << impl_->log_prefix << " av_interleaved_write_frame failed: " << ffmpeg_error_text(err);
+        if (!write_packet(current, input_stream, *output)) {
+            LOG << impl_->log_prefix << " av_interleaved_write_frame failed";
             finalize();
             return;
         }

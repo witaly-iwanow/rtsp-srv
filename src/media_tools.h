@@ -59,6 +59,7 @@ public:
 
 private:
     void start_on_executor();
+    bool handle_eof_rewind();
     void schedule_next_packet();
     void handle_timer(asio::error_code ec);
     void complete_startup(bool ok, std::string error_text = {});
