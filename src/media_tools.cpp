@@ -883,6 +883,7 @@ void MediaStreamer::schedule_next_packet() {
         if (!write_packet(current, input_stream, *output)) {
             LOG << impl_->log_prefix << " av_interleaved_write_frame failed";
             finalize();
+            return;
         }
     }
 }
