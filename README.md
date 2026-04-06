@@ -2,7 +2,7 @@
 
 A simple RTSP server for serving local media files over RTP, based on `Asio` for async I/O and networking, and `libavformat`, `libavcodec`, and `libavutil` for transmuxing and transcoding. The server implements the RTSP control logic and streams requested files in a loop, and can serve multiple clients simultaneously.
 
-The server supports video-only, audio-only, and audio+video inputs. In practice it can handle any format FFmpeg supports; the current implementation, however, whitelists only certain extensions in [src/rtsp_server.cpp](https://github.com/witaly-iwanow/rtsp-srv/blob/a82538393bdea4de1c4a7d18804ba64106a851ed/src/rtsp_server.cpp#L19), feel free to edit it.
+The server supports video-only, audio-only, and audio+video inputs. In practice it can handle any format FFmpeg supports.
 
 The server handles `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, and `TEARDOWN`. SDP is generated in-process from RTP muxer contexts, and on `PLAY` the server opens the requested file itself and writes RTP packets directly to the client ports negotiated during `SETUP`.
 Supported RTSP transport: UDP unicast RTP/RTCP with `client_port=` negotiation. Interleaved RTP over RTSP/TCP is not implemented.

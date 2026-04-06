@@ -1,10 +1,9 @@
 #include "rtsp_server.h"
 #include "logger.h"
+#include "utils.h"
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
-#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <csignal>
@@ -15,8 +14,6 @@
 namespace {
 
 using asio::ip::tcp;
-
-constexpr std::array<const char*, 5> kSupportedExtensions = {".mp4", ".mkv", ".webm", ".mov", ".flv"};
 
 std::size_t default_media_threads() {
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
@@ -32,28 +29,12 @@ void install_sigpipe_handler() {
         LOG << "sigaction(SIGPIPE) failed: " << std::strerror(errno);
 }
 
-std::string to_lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return std::tolower(c);
-    });
-    return value;
-}
-
-bool is_supported_extension(const std::filesystem::path& path) {
-    const std::string ext = to_lower(path.extension().string());
-    for (auto supported: kSupportedExtensions)
-        if (ext == supported)
-            return true;
-
-    return false;
-}
-
 bool is_wildcard_host(const std::string& host) {
     return host == "0.0.0.0" || host == "::";
 }
 
 bool is_loopback_host(const std::string& host) {
-    return host == "127.0.0.1" || host == "::1" || to_lower(host) == "localhost";
+    return host == "127.0.0.1" || host == "::1" || util::to_lower(host) == "localhost";
 }
 
 std::string endpoint_to_string(const tcp::endpoint& endpoint) {
@@ -61,19 +42,6 @@ std::string endpoint_to_string(const tcp::endpoint& endpoint) {
     if (endpoint.address().is_v6())
         return "[" + host + "]:" + std::to_string(endpoint.port());
     return host + ":" + std::to_string(endpoint.port());
-}
-
-std::size_t find_media_files(const std::filesystem::path& media_dir) {
-    std::size_t count = 0;
-    for (const auto& entry: std::filesystem::directory_iterator(media_dir)) {
-        const auto& path = entry.path();
-        if (is_regular_file(entry.status()) && is_supported_extension(path)) {
-            ++count;
-            LOG << "Media #" << count << ": " << path.filename();
-        }
-    }
-
-    return count;
 }
 
 std::vector<tcp::endpoint> resolve_bind_endpoints(
@@ -266,15 +234,6 @@ int RtspServer::run() {
     }
 
     LOG << "Serving media from " << media_dir_;
-    if (find_media_files(media_dir_) == 0) {
-        std::string supported_list;
-        for (auto ext: kSupportedExtensions)
-            supported_list += (supported_list.empty() ? "" : ", ") + std::string(ext);
-
-        LOG << "No supported media files (" << supported_list << ") found in " << media_dir_;
-
-        return 1;
-    }
 
     if (!open_acceptor())
         return 1;

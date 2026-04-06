@@ -1,8 +1,7 @@
 #include "session.h"
 #include "logger.h"
+#include "utils.h"
 
-#include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -54,28 +53,6 @@ std::pair<std::uint16_t, std::uint16_t> make_server_ports(std::uint32_t session_
     return {rtp, static_cast<std::uint16_t>(rtp + 1)};
 }
 
-std::string to_lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return std::tolower(c);
-    });
-    return value;
-}
-
-std::string to_upper(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return std::toupper(c);
-    });
-    return value;
-}
-
-std::string trim(const std::string& value) {
-    const std::size_t first = value.find_first_not_of(" \t");
-    if (first == std::string::npos)
-        return "";
-    const std::size_t last = value.find_last_not_of(" \t");
-    return value.substr(first, last - first + 1);
-}
-
 std::string strip_track_suffix(const std::string& uri) {
     const std::size_t pos = uri.rfind("/trackID=");
     if (pos == std::string::npos)
@@ -120,9 +97,9 @@ std::size_t parse_content_length(const std::string& headers) {
         const std::size_t end = headers.find("\r\n", start);
         const std::size_t line_len = (end == std::string::npos ? headers.size() : end) - start;
         const std::string line = headers.substr(start, line_len);
-        const std::string lower_line = to_lower(line);
+        const std::string lower_line = util::to_lower(line);
         if (lower_line.rfind(kContentLength, 0) == 0) {
-            const std::string raw = trim(line.substr(std::strlen(kContentLength)));
+            const std::string raw = util::trim(line.substr(std::strlen(kContentLength)));
             if (raw.empty())
                 return 0;
             try {
@@ -176,8 +153,8 @@ bool parse_rtsp_request(const std::string& raw, RtspRequest& request) {
         const std::string line = raw.substr(cursor, next - cursor);
         const std::size_t sep = line.find(':');
         if (sep != std::string::npos) {
-            const std::string key = to_lower(trim(line.substr(0, sep)));
-            const std::string value = trim(line.substr(sep + 1));
+            const std::string key = util::to_lower(util::trim(line.substr(0, sep)));
+            const std::string value = util::trim(line.substr(sep + 1));
             if (!key.empty())
                 request.headers[key] = value;
         }
@@ -185,7 +162,7 @@ bool parse_rtsp_request(const std::string& raw, RtspRequest& request) {
     }
 
     request.body = raw.substr(headers_end + 4);
-    request.method = to_upper(request.method);
+    request.method = util::to_upper(request.method);
     return true;
 }
 
@@ -197,7 +174,7 @@ std::string get_header(const RtspRequest& request, const std::string& key_lower)
 }
 
 bool parse_client_ports(const std::string& transport, std::uint16_t& rtp, std::uint16_t& rtcp) {
-    const std::string lower = to_lower(transport);
+    const std::string lower = util::to_lower(transport);
     const std::size_t pos = lower.find("client_port=");
     if (pos == std::string::npos)
         return false;
@@ -267,8 +244,8 @@ std::string cseq_or_zero(const std::string& cseq) {
 std::string session_id_only(const std::string& session_header) {
     const std::size_t semi = session_header.find(';');
     if (semi == std::string::npos)
-        return trim(session_header);
-    return trim(session_header.substr(0, semi));
+        return util::trim(session_header);
+    return util::trim(session_header.substr(0, semi));
 }
 
 std::string endpoint_host(const std::string& endpoint) {
@@ -587,7 +564,7 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
 
     const std::string media_uri = strip_track_suffix(uri);
     if (!load_media_description(media_path, media_uri))
-        return make_response(415, "Unsupported Media Type", cseq, {}, "");
+        return make_response(404, "Not Found", cseq, {}, "");
 
     std::string base = current_media_uri_;
     if (!base.empty() && base.back() != '/')
@@ -634,7 +611,7 @@ Session::RequestOutcome Session::handle_setup(
     }
 
     if (!load_media_description(media_path, media_uri))
-        return make_response(415, "Unsupported Media Type", cseq, {}, "");
+        return make_response(404, "Not Found", cseq, {}, "");
 
     // Accept aggregate SETUP only for single-track media; for A+V, require explicit /trackID=...
     int track_id = -1;

@@ -1,17 +1,17 @@
 #include "media_tools.h"
 #include "logger.h"
+#include "utils.h"
 
 extern "C" {
+#include <libavcodec/bsf.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/time.h>
 }
 
-#include <algorithm>
 #include <array>
 #include <chrono>
-#include <cctype>
 #include <cstdint>
 #include <condition_variable>
 #include <cstring>
@@ -27,13 +27,6 @@ namespace {
 constexpr std::uint16_t kDescribeVideoRtpPort = 40000;
 constexpr std::uint16_t kDescribeAudioRtpPort = 40002;
 
-std::string to_lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return std::tolower(c);
-    });
-    return value;
-}
-
 bool is_passthrough_video_codec(AVCodecID codec_id) {
     return codec_id == AV_CODEC_ID_HEVC || codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_MPEG2VIDEO
         || codec_id == AV_CODEC_ID_VP8 || codec_id == AV_CODEC_ID_VP9;
@@ -42,21 +35,6 @@ bool is_passthrough_video_codec(AVCodecID codec_id) {
 bool is_passthrough_audio_codec(AVCodecID codec_id) {
     return codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_MP1
         || codec_id == AV_CODEC_ID_MP2 || codec_id == AV_CODEC_ID_MP3;
-}
-
-bool parse_int(const std::string& text, int& out) {
-    if (text.empty())
-        return false;
-    try {
-        std::size_t pos = 0;
-        const int value = std::stoi(text, &pos);
-        if (pos != text.size())
-            return false;
-        out = value;
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
 }
 
 std::string ffmpeg_error_text(int errnum) {
@@ -235,6 +213,61 @@ private:
     AVPacket* packet_ = nullptr;
 };
 
+// RAII wrapper for the FFmpeg bitstream filter we use to derive AAC extradata from ADTS packets.
+class BitstreamFilterContext {
+public:
+    BitstreamFilterContext() = default;
+    BitstreamFilterContext(const BitstreamFilterContext&) = delete;
+    BitstreamFilterContext& operator=(const BitstreamFilterContext&) = delete;
+
+    ~BitstreamFilterContext() {
+        reset();
+    }
+
+    AVBSFContext* get() const {
+        return context_;
+    }
+
+    bool init(const char* filter_name, AVStream* stream, std::string& error_text) {
+        reset();
+
+        const AVBitStreamFilter* filter = av_bsf_get_by_name(filter_name);
+        if (filter == nullptr) {
+            error_text = std::string("bitstream filter not available: ") + filter_name;
+            return false;
+        }
+
+        int err = av_bsf_alloc(filter, &context_);
+        if (err < 0) {
+            error_text = "av_bsf_alloc failed: " + ffmpeg_error_text(err);
+            return false;
+        }
+
+        err = avcodec_parameters_copy(context_->par_in, stream->codecpar);
+        if (err < 0) {
+            error_text = "avcodec_parameters_copy failed: " + ffmpeg_error_text(err);
+            return false;
+        }
+        context_->time_base_in = stream->time_base;
+
+        err = av_bsf_init(context_);
+        if (err < 0) {
+            error_text = "av_bsf_init failed: " + ffmpeg_error_text(err);
+            return false;
+        }
+
+        return true;
+    }
+
+    void reset() {
+        if (context_ != nullptr)
+            av_bsf_free(&context_);
+    }
+
+private:
+    AVBSFContext* context_ = nullptr;
+};
+
 struct ActiveTrack {
     int input_index = -1;
     OutputFormatContext output;
@@ -373,7 +406,7 @@ void remember_payload_types_from_sdp(const std::string& sdp, MediaDescription& m
             continue;
 
         int payload_type = -1;
-        if (!parse_int(payload_text, payload_type))
+        if (!util::parse_int(payload_text, payload_type))
             continue;
 
         if (media_type == "video" && media.video.present && media.video.rtp_payload_type < 0)
@@ -389,7 +422,7 @@ bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) 
 
     track.present = true;
     track.stream_index = stream->index;
-    track.codec_name = to_lower(avcodec_get_name(stream->codecpar->codec_id));
+    track.codec_name = util::to_lower(avcodec_get_name(stream->codecpar->codec_id));
     track.channels = stream->codecpar->ch_layout.nb_channels;
     track.sample_rate = stream->codecpar->sample_rate;
     track.copy = is_video ? is_passthrough_video_codec(stream->codecpar->codec_id)
@@ -462,6 +495,87 @@ bool rewind_input(AVFormatContext* input, std::string& error_text) {
     return true;
 }
 
+bool copy_codec_extradata(AVCodecParameters* codecpar, const std::uint8_t* data, int size, std::string& error_text) {
+    if (codecpar == nullptr || data == nullptr || size <= 0) {
+        error_text = "invalid codec extradata";
+        return false;
+    }
+
+    auto* extradata = static_cast<std::uint8_t*>(av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (extradata == nullptr) {
+        error_text = "av_mallocz failed for codec extradata";
+        return false;
+    }
+
+    std::memcpy(extradata, data, static_cast<std::size_t>(size));
+    av_freep(&codecpar->extradata);
+    codecpar->extradata = extradata;
+    codecpar->extradata_size = size;
+    return true;
+}
+
+bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, std::string& error_text) {
+    if (stream == nullptr || stream->codecpar == nullptr || stream->codecpar->codec_id != AV_CODEC_ID_AAC)
+        return true;
+    if (stream->codecpar->extradata != nullptr && stream->codecpar->extradata_size > 0)
+        return true;
+
+    BitstreamFilterContext bsf;
+    if (!bsf.init("aac_adtstoasc", stream, error_text))
+        return false;
+
+    PacketHandle input_packet;
+    PacketHandle filtered_packet;
+    while (true) {
+        int err = av_read_frame(input, input_packet.get());
+        if (err == AVERROR_EOF) {
+            error_text = "no AAC packet produced AudioSpecificConfig";
+            return false;
+        }
+        if (err < 0) {
+            error_text = "av_read_frame failed: " + ffmpeg_error_text(err);
+            return false;
+        }
+
+        if (input_packet.get()->stream_index != stream->index) {
+            input_packet.reset();
+            continue;
+        }
+
+        err = av_bsf_send_packet(bsf.get(), input_packet.get());
+        input_packet.reset();
+        if (err < 0) {
+            error_text = "av_bsf_send_packet failed: " + ffmpeg_error_text(err);
+            return false;
+        }
+
+        while (true) {
+            err = av_bsf_receive_packet(bsf.get(), filtered_packet.get());
+            if (err == AVERROR(EAGAIN) || err == AVERROR_EOF)
+                break;
+            if (err < 0) {
+                error_text = "av_bsf_receive_packet failed: " + ffmpeg_error_text(err);
+                return false;
+            }
+            std::size_t side_data_size = 0;
+            const std::uint8_t* side_data = av_packet_get_side_data(
+                filtered_packet.get(), AV_PKT_DATA_NEW_EXTRADATA, &side_data_size);
+            if (side_data != nullptr && side_data_size > 0) {
+                return copy_codec_extradata(
+                    stream->codecpar, side_data, static_cast<int>(side_data_size), error_text);
+            }
+            filtered_packet.reset();
+        }
+
+        if (bsf.get()->par_out != nullptr && bsf.get()->par_out->extradata_size > 0)
+            return copy_codec_extradata(
+                stream->codecpar,
+                bsf.get()->par_out->extradata,
+                bsf.get()->par_out->extradata_size,
+                error_text);
+    }
+}
+
 }  // namespace
 
 bool describe_media(const std::filesystem::path& media_path, MediaDescription& media) {
@@ -498,6 +612,16 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 
     if (!media.video.present && !media.audio.present) {
         LOG << "No supported media tracks found in " << media_path;
+        return false;
+    }
+
+    if (media.audio.present
+        && !derive_aac_audio_specific_config(input.get(), input.get()->streams[media.audio.stream_index], error_text)) {
+        LOG << "Failed to derive AAC AudioSpecificConfig for " << media_path << ": " << error_text;
+        return false;
+    }
+    if (!rewind_input(input.get(), error_text)) {
+        LOG << "Failed to rewind input after media inspection for " << media_path << ": " << error_text;
         return false;
     }
 
@@ -627,6 +751,19 @@ void MediaStreamer::complete_startup(bool ok, std::string error_text) {
 void MediaStreamer::start_on_executor() {
     std::string error_text;
     if (!impl_->input.open(impl_->media_path, error_text)) {
+        complete_startup(false, std::move(error_text));
+        finalize();
+        return;
+    }
+
+    if (impl_->audio_target.enabled
+        && !derive_aac_audio_specific_config(
+            impl_->input.get(), impl_->input.get()->streams[impl_->media.audio.stream_index], error_text)) {
+        complete_startup(false, std::move(error_text));
+        finalize();
+        return;
+    }
+    if (!rewind_input(impl_->input.get(), error_text)) {
         complete_startup(false, std::move(error_text));
         finalize();
         return;
