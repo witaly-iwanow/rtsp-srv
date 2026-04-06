@@ -66,14 +66,18 @@ Build the image:
 docker build -t rtsp-srv:ubuntu24.04 .
 ```
 
-Run it with a media directory mounted into `/media`. The container serves from `.` inside `/media`, matching the native default:
+Run it with a media directory mounted into `/media`. The container serves from `.` inside `/media`, matching the native default.
+Besides the RTSP TCP port, publish the UDP server-port range the RTSP `SETUP` replies advertise for RTP/RTCP:
 
 ```bash
 docker run --rm -it \
-  -p 554:554 \
+  -p 554:554/tcp \
+  -p 50000-64999:50000-64999/udp \
   -v "$PWD:/media:ro" \
   rtsp-srv:ubuntu24.04
 ```
+
+The server allocates RTP/RTCP server ports from `50000-64999/udp`, so that range must be reachable from the client when running in Docker bridge mode.
 
 Then open media through RTSP, for example:
 
