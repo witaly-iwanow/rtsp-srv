@@ -5,17 +5,16 @@
 #include "session.h"
 
 #include <atomic>
-#include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 class RtspServer {
 public:
-    RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service);
+    RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service, std::size_t media_threads = 0);
 
-    int run();
+    [[nodiscard]] int run();
 
 private:
     using Acceptor = asio::ip::tcp::acceptor;
@@ -33,6 +32,7 @@ private:
     std::filesystem::path media_dir_;
     std::string host_;
     std::string service_;
+    std::size_t media_threads_;
     asio::io_context io_context_;
     asio::thread_pool media_pool_;
     Acceptor acceptor_;

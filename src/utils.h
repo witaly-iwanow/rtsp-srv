@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cctype>
 #include <string>
+#include <string_view>
 
 namespace util {
 
@@ -21,15 +22,15 @@ inline auto to_upper(std::string value) {
     return value;
 }
 
-inline auto trim(const std::string& value) {
+inline auto trim(const std::string_view value) {
     const auto first = value.find_first_not_of(" \t");
-    if (first == std::string::npos)
+    if (first == std::string_view::npos)
         return std::string{};
     const auto last = value.find_last_not_of(" \t");
-    return value.substr(first, last - first + 1);
+    return std::string(value.substr(first, last - first + 1));
 }
 
-inline bool parse_int(const std::string& text, int& out) {
+inline bool parse_int(const std::string_view text, int& out) {
     const auto trimmed = trim(text);
     if (trimmed.empty())
         return false;

@@ -134,12 +134,14 @@ public:
         stream_ = avformat_new_stream(context_, nullptr);
         if (stream_ == nullptr) {
             error_text = "avformat_new_stream failed";
+            reset();
             return false;
         }
 
         err = avcodec_parameters_copy(stream_->codecpar, input_stream->codecpar);
         if (err < 0) {
             error_text = "avcodec_parameters_copy failed: " + ffmpeg_error_text(err);
+            reset();
             return false;
         }
         if (payload_type >= 0 && payload_type <= 127)
@@ -155,6 +157,7 @@ public:
             err = avio_open2(&context_->pb, url.c_str(), AVIO_FLAG_WRITE, nullptr, nullptr);
             if (err < 0) {
                 error_text = "avio_open2 failed: " + ffmpeg_error_text(err);
+                reset();
                 return false;
             }
         }
@@ -170,6 +173,7 @@ public:
         av_dict_free(&options);
         if (err < 0) {
             error_text = "avformat_write_header failed: " + ffmpeg_error_text(err);
+            reset();
             return false;
         }
         header_written_ = true;
@@ -247,6 +251,7 @@ public:
         err = avcodec_parameters_copy(context_->par_in, stream->codecpar);
         if (err < 0) {
             error_text = "avcodec_parameters_copy failed: " + ffmpeg_error_text(err);
+            reset();
             return false;
         }
         context_->time_base_in = stream->time_base;
@@ -254,6 +259,7 @@ public:
         err = av_bsf_init(context_);
         if (err < 0) {
             error_text = "av_bsf_init failed: " + ffmpeg_error_text(err);
+            reset();
             return false;
         }
 

@@ -2,11 +2,9 @@
 
 #include <asio.hpp>
 
-#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <vector>
 
 struct MediaTrack {
     bool present = false;
@@ -50,9 +48,9 @@ public:
     MediaStreamer(const MediaStreamer&) = delete;
     MediaStreamer& operator=(const MediaStreamer&) = delete;
 
-    bool start();
+    [[nodiscard]] bool start();
     void stop();
-    bool running() const;
+    [[nodiscard]] bool running() const;
 
 private:
     void start_on_executor();

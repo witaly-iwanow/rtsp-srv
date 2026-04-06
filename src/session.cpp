@@ -235,12 +235,6 @@ bool parse_media_relative_path(const std::string& uri, std::filesystem::path& re
     return !relative_path.empty();
 }
 
-std::string cseq_or_zero(const std::string& cseq) {
-    if (cseq.empty())
-        return "0";
-    return cseq;
-}
-
 std::string session_id_only(const std::string& session_header) {
     const std::size_t semi = session_header.find(';');
     if (semi == std::string::npos)
@@ -350,7 +344,7 @@ Session::RequestOutcome Session::make_response(
     bool close_after_response) const {
     std::ostringstream response;
     response << "RTSP/1.0 " << status_code << ' ' << reason << "\r\n";
-    response << "CSeq: " << cseq_or_zero(cseq) << "\r\n";
+    response << "CSeq: " << cseq << "\r\n";
     for (const auto& [key, value]: headers)
         response << key << ": " << value << "\r\n";
     if (!body.empty())
@@ -459,9 +453,15 @@ void Session::finish() {
     close_socket();
     stop_streaming();
 
-    CloseHandler on_close = std::move(on_close_);
-    if (on_close)
-        on_close(session_id_, remote_endpoint_);
+    try {
+        CloseHandler on_close = std::move(on_close_);
+        if (on_close)
+            on_close(session_id_, remote_endpoint_);
+    } catch (const std::exception& ex) {
+        log() << "on_close callback threw: " << ex.what();
+    } catch (...) {
+        log() << "on_close callback threw unknown exception";
+    }
 }
 
 bool Session::load_media_description(const std::filesystem::path& media_path, const std::string& media_uri) {
@@ -687,6 +687,8 @@ Session::RequestOutcome Session::handle_request(const std::string& raw_request) 
 
     log() << request.method;
     const std::string cseq = get_header(request, "cseq");
+    if (cseq.empty())
+        return make_response(400, "Bad Request", "0", {}, "");
 
     if (request.method == "OPTIONS")
         return handle_options(cseq);

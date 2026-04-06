@@ -67,11 +67,12 @@ std::vector<tcp::endpoint> resolve_bind_endpoints(
 
 }  // namespace
 
-RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service):
+RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service, std::size_t media_threads):
     media_dir_(media_dir),
     host_(host),
     service_(std::move(service)),
-    media_pool_(default_media_threads()),
+    media_threads_(media_threads),
+    media_pool_(media_threads_ > 0 ? media_threads_ : default_media_threads()),
     acceptor_(io_context_),
     signals_(io_context_, SIGINT, SIGTERM) {}
 
@@ -140,11 +141,9 @@ void RtspServer::start_accept() {
 void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
     if (shutting_down_)
         return;
+
     if (ec) {
-        if (ec != asio::error::operation_aborted)
-            LOG << "accept() failed: " << ec.message();
-        if (!shutting_down_)
-            start_accept();
+        LOG << "accept() failed: " << ec.message();
         return;
     }
 
@@ -166,8 +165,6 @@ void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
 }
 
 void RtspServer::handle_stop_signal(asio::error_code ec, int) {
-    if (ec == asio::error::operation_aborted)
-        return;
     if (ec) {
         LOG << "signal handling failed: " << ec.message();
         return;
@@ -222,8 +219,7 @@ void RtspServer::on_session_closed(std::uint32_t session_id, const std::string& 
 }
 
 int RtspServer::run() {
-    bool expected = false;
-    if (!run_called_.compare_exchange_strong(expected, true)) {
+    if (bool expected = false; !run_called_.compare_exchange_strong(expected, true)) {
         LOG << "run() can be called only once per RtspServer instance";
         return 1;
     }

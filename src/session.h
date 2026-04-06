@@ -6,7 +6,6 @@
 #include "media_tools.h"
 
 #include <array>
-#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -70,8 +69,8 @@ private:
     void handle_write(asio::error_code ec, std::size_t bytes_written);
     void close_socket();
     void finish();
-    bool load_media_description(const std::filesystem::path& media_path, const std::string& media_uri);
-    bool start_streaming();
+    [[nodiscard]] bool load_media_description(const std::filesystem::path& media_path, const std::string& media_uri);
+    [[nodiscard]] bool start_streaming();
     void stop_streaming();
     RequestOutcome handle_request(const std::string& raw_request);
     RequestOutcome handle_options(const std::string& cseq) const;
