@@ -3,6 +3,7 @@
 #include <asio.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,9 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 // Runs on a dedicated executor (strand) so the calling RTSP thread is not blocked after startup.
 class MediaStreamer {
 public:
+    using StartHandler = std::function<void(bool, std::string)>;
+    using StopHandler = std::function<void()>;
+
     MediaStreamer(
         asio::any_io_executor executor,
         std::filesystem::path media_path,
@@ -53,8 +57,8 @@ public:
     MediaStreamer(const MediaStreamer&) = delete;
     MediaStreamer& operator=(const MediaStreamer&) = delete;
 
-    [[nodiscard]] bool start();
-    void stop();
+    void start(StartHandler handler);
+    void stop(StopHandler handler = {});
     [[nodiscard]] bool running() const;
 
 private:

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -44,14 +45,6 @@ bool track_id_is_audio(const MediaDescription& media, int track_id) {
 
 std::string make_rtp_cname(std::uint32_t session_id) {
     return "rtsp-srv-" + std::to_string(session_id);
-}
-
-std::pair<std::uint16_t, std::uint16_t> make_server_ports(std::uint32_t session_id, std::uint16_t base_port) {
-    constexpr std::uint16_t kPortSpan = 15000;
-    constexpr std::uint16_t kPortsPerSession = 4;
-    const std::uint16_t offset = static_cast<std::uint16_t>(((session_id - 1) * kPortsPerSession) % kPortSpan);
-    const std::uint16_t rtp = static_cast<std::uint16_t>(base_port + offset);
-    return {rtp, static_cast<std::uint16_t>(rtp + 1)};
 }
 
 std::string strip_track_suffix(const std::string& uri) {
@@ -206,6 +199,64 @@ bool parse_client_ports(const std::string& transport, std::uint16_t& rtp, std::u
     }
 }
 
+bool port_is_reserved(std::uint16_t port, const std::vector<std::uint16_t>& reserved_ports) {
+    for (const std::uint16_t reserved: reserved_ports)
+        if (reserved != 0 && reserved == port)
+            return true;
+    return false;
+}
+
+bool allocate_server_ports(
+    Session::Socket& socket,
+    const std::vector<std::uint16_t>& reserved_ports,
+    std::uint16_t& server_rtp,
+    std::uint16_t& server_rtcp) {
+    using asio::ip::udp;
+
+    asio::error_code ec;
+    const auto local_endpoint = socket.local_endpoint(ec);
+    if (ec)
+        return false;
+
+    const udp::endpoint bind_endpoint(local_endpoint.address(), 0);
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        // Pick an OS-assigned even RTP port, then reserve RTP+1 for RTCP.
+        udp::socket rtp_socket(socket.get_executor());
+        rtp_socket.open(bind_endpoint.protocol(), ec);
+        if (ec)
+            continue;
+
+        rtp_socket.bind(bind_endpoint, ec);
+        if (ec)
+            continue;
+
+        const auto rtp_endpoint = rtp_socket.local_endpoint(ec);
+        if (ec)
+            continue;
+
+        const std::uint16_t rtp_port = rtp_endpoint.port();
+        if ((rtp_port & 1u) != 0 || rtp_port == std::numeric_limits<std::uint16_t>::max())
+            continue;
+        if (port_is_reserved(rtp_port, reserved_ports) || port_is_reserved(static_cast<std::uint16_t>(rtp_port + 1), reserved_ports))
+            continue;
+
+        udp::socket rtcp_socket(socket.get_executor());
+        rtcp_socket.open(bind_endpoint.protocol(), ec);
+        if (ec)
+            continue;
+
+        rtcp_socket.bind(udp::endpoint(bind_endpoint.address(), static_cast<std::uint16_t>(rtp_port + 1)), ec);
+        if (ec)
+            continue;
+
+        server_rtp = rtp_port;
+        server_rtcp = static_cast<std::uint16_t>(rtp_port + 1);
+        return true;
+    }
+
+    return false;
+}
+
 // We only support plain UDP unicast RTP/RTCP via RTP/AVP + client_port=...
 // Multicast and interleaved RTP-over-RTSP/TCP transports are rejected
 bool is_supported_transport(const std::string& transport) {
@@ -289,18 +340,10 @@ Session::Session(Socket socket, std::string remote_endpoint, const std::filesyst
     media_dir_(media_dir),
     media_executor_(std::move(media_executor)),
     session_id_(session_id),
-    on_close_(std::move(on_close)) {
-    const auto [video_rtp, video_rtcp] = make_server_ports(session_id_, 50000);
-    video_ports_.server_rtp = video_rtp;
-    video_ports_.server_rtcp = video_rtcp;
-
-    const auto [audio_rtp, audio_rtcp] = make_server_ports(session_id_, 50002);
-    audio_ports_.server_rtp = audio_rtp;
-    audio_ports_.server_rtcp = audio_rtcp;
-}
+    on_close_(std::move(on_close)) {}
 
 Session::~Session() {
-    stop_streaming();
+    streamer_.reset();
 }
 
 void Session::start() {
@@ -311,8 +354,13 @@ void Session::shutdown() {
     if (finished_)
         return;
 
-    stop_streaming();
-    queue_response(make_response(503, "Service Unavailable", "0", {{"Connection", "close"}, {"Reason", "server shutting down"}}, "", true));
+    RequestOutcome outcome = make_response(503, "Service Unavailable", "0", {{"Connection", "close"}, {"Reason", "server shutting down"}}, "", true);
+    if (stream_state_ == StreamState::Idle && !streamer_) {
+        queue_response(std::move(outcome));
+        return;
+    }
+
+    stop_playback(std::move(outcome), false);
 }
 
 const std::string& Session::remote_endpoint() const {
@@ -390,17 +438,132 @@ void Session::handle_read(asio::error_code ec, std::size_t bytes_read) {
 }
 
 void Session::process_pending_requests() {
+    // PLAY/TEARDOWN responses are completed later from media callbacks.
+    if (stream_state_ == StreamState::Starting || stream_state_ == StreamState::Stopping)
+        return;
+
     while (!finished_) {
         std::string request;
         if (!extract_next_rtsp_request(pending_requests_, request))
             return;
 
-        RequestOutcome outcome = handle_request(request);
+        std::optional<RequestOutcome> outcome = handle_request(request);
+        if (!outcome)
+            return;
+
+        const bool close_after_response = outcome->close_after_response;
+        queue_response(std::move(*outcome));
+        if (close_after_response)
+            return;
+
+        if (stream_state_ == StreamState::Starting || stream_state_ == StreamState::Stopping)
+            return;
+    }
+}
+
+void Session::start_playback(std::string cseq) {
+    if (!streamer_) {
+        queue_response(make_response(500, "Internal Server Error", cseq, {}, ""));
+        return;
+    }
+
+    stream_state_ = StreamState::Starting;
+    const auto executor = socket_.get_executor();
+    std::weak_ptr<Session> weak_self(shared_from_this());
+    // Complete startup on the media strand, but resume RTSP handling on the socket executor.
+    streamer_->start([weak_self, executor, cseq = std::move(cseq)](bool ok, std::string error_text) mutable {
+        asio::post(executor, [weak_self, ok, cseq = std::move(cseq), error_text = std::move(error_text)]() mutable {
+            if (auto self = weak_self.lock())
+                self->handle_playback_started(ok, std::move(cseq), std::move(error_text));
+        });
+    });
+}
+
+void Session::handle_playback_started(bool ok, std::string cseq, std::string) {
+    if (finished_)
+        return;
+
+    if (stream_state_ == StreamState::Stopping) {
+        if (!ok)
+            streamer_.reset();
+        return;
+    }
+
+    if (stream_state_ != StreamState::Starting)
+        return;
+
+    if (!ok) {
+        stream_state_ = StreamState::Idle;
+        streamer_.reset();
+        queue_response(make_response(500, "Internal Server Error", cseq, {}, ""));
+        process_pending_requests();
+        return;
+    }
+
+    stream_state_ = StreamState::Playing;
+    queue_response(make_response(200, "OK", cseq, {{"Session", session_id_text()}}, ""));
+    process_pending_requests();
+}
+
+void Session::stop_playback(std::optional<RequestOutcome> response, bool finish_after_stop) {
+    if (response)
+        pending_stop_response_ = std::move(response);
+    finish_after_stop_ = finish_after_stop_ || finish_after_stop;
+
+    if (!streamer_) {
+        stream_state_ = StreamState::Idle;
+        if (finish_after_stop_) {
+            finish_after_stop_ = false;
+            finalize_close();
+            return;
+        }
+        if (pending_stop_response_) {
+            RequestOutcome outcome = std::move(*pending_stop_response_);
+            pending_stop_response_.reset();
+            const bool close_after_response = outcome.close_after_response;
+            queue_response(std::move(outcome));
+            if (close_after_response)
+                return;
+        }
+        process_pending_requests();
+        return;
+    }
+
+    if (stream_state_ == StreamState::Stopping)
+        return;
+
+    // Multiple stop triggers can race; only the first one actually drives the streamer.
+    stream_state_ = StreamState::Stopping;
+    const auto executor = socket_.get_executor();
+    std::weak_ptr<Session> weak_self(shared_from_this());
+    streamer_->stop([weak_self, executor]() {
+        asio::post(executor, [weak_self]() {
+            if (auto self = weak_self.lock())
+                self->handle_playback_stopped();
+        });
+    });
+}
+
+void Session::handle_playback_stopped() {
+    stream_state_ = StreamState::Idle;
+    streamer_.reset();
+
+    if (finished_ || finish_after_stop_) {
+        finish_after_stop_ = false;
+        finalize_close();
+        return;
+    }
+
+    if (pending_stop_response_) {
+        RequestOutcome outcome = std::move(*pending_stop_response_);
+        pending_stop_response_.reset();
         const bool close_after_response = outcome.close_after_response;
         queue_response(std::move(outcome));
         if (close_after_response)
             return;
     }
+
+    process_pending_requests();
 }
 
 void Session::queue_response(RequestOutcome outcome) {
@@ -456,6 +619,16 @@ void Session::close_socket() {
     socket_.close(ec);
 }
 
+void Session::finalize_close() {
+    try {
+        CloseHandler on_close = std::move(on_close_);
+        if (on_close)
+            on_close(session_id_, remote_endpoint_);
+    } catch (...) {
+        log() << "on_close callback threw an exception";
+    }
+}
+
 void Session::finish() {
     if (finished_)
         return;
@@ -464,16 +637,14 @@ void Session::finish() {
     close_after_write_ = true;
     pending_requests_.clear();
     write_queue_.clear();
+    pending_stop_response_.reset();
     close_socket();
-    stop_streaming();
-
-    try {
-        CloseHandler on_close = std::move(on_close_);
-        if (on_close)
-            on_close(session_id_, remote_endpoint_);
-    } catch (...) {
-        log() << "on_close callback threw an exception";
+    if (streamer_ || stream_state_ == StreamState::Starting || stream_state_ == StreamState::Playing || stream_state_ == StreamState::Stopping) {
+        stop_playback(std::nullopt, true);
+        return;
     }
+
+    finalize_close();
 }
 
 bool Session::load_media_description(const std::filesystem::path& media_path, const std::string& media_uri) {
@@ -501,9 +672,7 @@ bool Session::load_media_description(const std::filesystem::path& media_path, co
     return true;
 }
 
-bool Session::start_streaming() {
-    if (streamer_ && streamer_->running())
-        return true;
+bool Session::create_streamer() {
     if (current_media_path_.empty() || current_media_.sdp.empty())
         return false;
 
@@ -536,20 +705,8 @@ bool Session::start_streaming() {
         audio_target.server_rtcp = audio_ports_.server_rtcp;
     }
 
-    auto streamer = std::make_unique<MediaStreamer>(media_executor_, current_media_path_, current_media_, video_target, audio_target, make_rtp_cname(session_id_), log_prefix());
-    if (!streamer->start())
-        return false;
-
-    streamer_ = std::move(streamer);
+    streamer_ = std::make_unique<MediaStreamer>(media_executor_, current_media_path_, current_media_, video_target, audio_target, make_rtp_cname(session_id_), log_prefix());
     return true;
-}
-
-void Session::stop_streaming() {
-    if (!streamer_)
-        return;
-
-    streamer_->stop();
-    streamer_.reset();
 }
 
 Session::RequestOutcome Session::handle_options(const std::string& cseq) const {
@@ -576,6 +733,9 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
 }
 
 Session::RequestOutcome Session::handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header) {
+    if (stream_state_ == StreamState::Starting || stream_state_ == StreamState::Stopping)
+        return make_response(455, "Method Not Valid In This State", cseq, {}, "");
+
     if (transport.empty())
         return make_response(461, "Unsupported Transport", cseq, {}, "");
     if (!is_supported_transport(transport))
@@ -602,7 +762,9 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
     }
 
     if (!current_media_path_.empty() && current_media_path_ != media_path) {
-        stop_streaming();
+        if (stream_state_ != StreamState::Idle)
+            return make_response(455, "Method Not Valid In This State", cseq, {}, "");
+        streamer_.reset();
         reset_track_state();
     }
 
@@ -636,6 +798,19 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
 
     ports->client_rtp = parsed_rtp;
     ports->client_rtcp = parsed_rtcp;
+    // Avoid reusing the client's ports when server and client run on the same host.
+    std::vector<std::uint16_t> reserved_ports = {
+        video_ports_.client_rtp,
+        video_ports_.client_rtcp,
+        audio_ports_.client_rtp,
+        audio_ports_.client_rtcp,
+        video_ports_.server_rtp,
+        video_ports_.server_rtcp,
+        audio_ports_.server_rtp,
+        audio_ports_.server_rtcp,
+    };
+    if (!allocate_server_ports(socket_, reserved_ports, ports->server_rtp, ports->server_rtcp))
+        return make_response(500, "Internal Server Error", cseq, {}, "");
     ports->setup = true;
 
     std::string transport_reply = "RTP/AVP;unicast;client_port=" + std::to_string(ports->client_rtp) + "-" + std::to_string(ports->client_rtcp);
@@ -643,7 +818,7 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
     return make_response(200, "OK", cseq, {{"Session", session_id_text()}, {"Transport", transport_reply}}, "");
 }
 
-Session::RequestOutcome Session::handle_play(const std::string& cseq, const std::string& session_header) {
+std::optional<Session::RequestOutcome> Session::handle_play(const std::string& cseq, const std::string& session_header) {
     if (!has_setup_tracks())
         return make_response(454, "Session Not Found", cseq, {}, "");
 
@@ -658,21 +833,30 @@ Session::RequestOutcome Session::handle_play(const std::string& cseq, const std:
     if (!std::filesystem::exists(current_media_path_))
         return make_response(404, "Not Found", cseq, {}, "");
 
-    if (!start_streaming())
+    if (stream_state_ == StreamState::Starting || stream_state_ == StreamState::Stopping)
+        return make_response(455, "Method Not Valid In This State", cseq, {}, "");
+    if (stream_state_ == StreamState::Playing)
+        return make_response(200, "OK", cseq, {{"Session", session_id_text()}}, "");
+    if (!create_streamer())
         return make_response(500, "Internal Server Error", cseq, {}, "");
 
-    return make_response(200, "OK", cseq, {{"Session", session_id_text()}}, "");
+    start_playback(cseq);
+    return std::nullopt;
 }
 
-Session::RequestOutcome Session::handle_teardown(const std::string& cseq) {
+std::optional<Session::RequestOutcome> Session::handle_teardown(const std::string& cseq) {
     std::vector<std::pair<std::string, std::string>> headers;
     if (has_setup_tracks())
         headers.emplace_back("Session", session_id_text());
-    stop_streaming();
-    return make_response(200, "OK", cseq, headers, "", true);
+
+    if (stream_state_ == StreamState::Idle && !streamer_)
+        return make_response(200, "OK", cseq, headers, "", true);
+
+    stop_playback(make_response(200, "OK", cseq, headers, "", true), false);
+    return std::nullopt;
 }
 
-Session::RequestOutcome Session::handle_request(const std::string& raw_request) {
+std::optional<Session::RequestOutcome> Session::handle_request(const std::string& raw_request) {
     RtspRequest request;
     if (!parse_rtsp_request(raw_request, request))
         return make_response(400, "Bad Request", "0", {}, "");

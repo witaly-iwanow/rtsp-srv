@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,13 @@ private:
         bool close_after_response = false;
     };
 
+    enum class StreamState {
+        Idle,
+        Starting,
+        Playing,
+        Stopping
+    };
+
     RequestOutcome make_response(
         int status_code,
         const std::string& reason,
@@ -62,20 +70,24 @@ private:
     void start_read();
     void handle_read(asio::error_code ec, std::size_t bytes_read);
     void process_pending_requests();
+    void start_playback(std::string cseq);
+    void handle_playback_started(bool ok, std::string cseq, std::string error_text);
+    void stop_playback(std::optional<RequestOutcome> response, bool finish_after_stop);
+    void handle_playback_stopped();
     void queue_response(RequestOutcome outcome);
     void start_write();
     void handle_write(asio::error_code ec, std::size_t bytes_written);
     void close_socket();
+    void finalize_close();
     void finish();
     [[nodiscard]] bool load_media_description(const std::filesystem::path& media_path, const std::string& media_uri);
-    [[nodiscard]] bool start_streaming();
-    void stop_streaming();
-    RequestOutcome handle_request(const std::string& raw_request);
+    [[nodiscard]] bool create_streamer();
+    std::optional<RequestOutcome> handle_request(const std::string& raw_request);
     RequestOutcome handle_options(const std::string& cseq) const;
     RequestOutcome handle_describe(const std::string& uri, const std::string& cseq);
     RequestOutcome handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header);
-    RequestOutcome handle_play(const std::string& cseq, const std::string& session_header);
-    RequestOutcome handle_teardown(const std::string& cseq);
+    std::optional<RequestOutcome> handle_play(const std::string& cseq, const std::string& session_header);
+    std::optional<RequestOutcome> handle_teardown(const std::string& cseq);
     std::string log_prefix() const;
     std::string session_id_text() const;
     bool has_setup_tracks() const;
@@ -98,4 +110,7 @@ private:
     std::deque<std::string> write_queue_;
     bool close_after_write_ = false;
     bool finished_ = false;
+    StreamState stream_state_ = StreamState::Idle;
+    std::optional<RequestOutcome> pending_stop_response_;
+    bool finish_after_stop_ = false;
 };

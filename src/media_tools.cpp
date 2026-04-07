@@ -13,10 +13,8 @@ extern "C" {
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <condition_variable>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -634,11 +632,13 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 struct MediaStreamer::Impl : public std::enable_shared_from_this<MediaStreamer::Impl> {
     explicit Impl(asio::any_io_executor executor): strand(asio::make_strand(std::move(executor))), timer(strand) {}
 
-    bool start();
-    void stop();
+    void start(StartHandler handler);
+    void stop(StopHandler handler);
     bool running_now() const;
     Logger::Entry log() const;
     void complete_startup(bool ok, std::string error_text = {});
+    void start_on_strand(StartHandler handler);
+    void stop_on_strand(StopHandler handler);
     void start_on_executor();
     bool handle_eof_rewind();
     void schedule_next_packet();
@@ -657,15 +657,12 @@ struct MediaStreamer::Impl : public std::enable_shared_from_this<MediaStreamer::
     ActiveTrack video;
     ActiveTrack audio;
     PacketHandle packet;
-    std::mutex state_mutex;
-    std::condition_variable state_cv;
     std::atomic<bool> running {false};
+    bool finalized = true;
+    bool starting = false;
     bool stop_requested = false;
-    bool startup_done = false;
-    bool startup_ok = false;
-    bool startup_reported = false;
-    bool stop_done = true;
-    std::string startup_error;
+    std::vector<StartHandler> start_handlers;
+    std::vector<StopHandler> stop_handlers;
     std::int64_t wall_start_us = AV_NOPTS_VALUE;
     std::int64_t media_start_us = AV_NOPTS_VALUE;
 };
@@ -716,68 +713,29 @@ MediaStreamer::~MediaStreamer() {
     stop();
 }
 
-bool MediaStreamer::start() {
-    return impl_->start();
+void MediaStreamer::start(StartHandler handler) {
+    impl_->start(std::move(handler));
 }
 
-void MediaStreamer::stop() {
-    impl_->stop();
+void MediaStreamer::stop(StopHandler handler) {
+    impl_->stop(std::move(handler));
 }
 
 bool MediaStreamer::running() const {
     return impl_->running_now();
 }
 
-bool MediaStreamer::Impl::start() {
-    if (running.load())
-        return running_now();
-
-    {
-        const std::lock_guard<std::mutex> lock(state_mutex);
-        stop_requested = false;
-        startup_done = false;
-        startup_ok = false;
-        startup_reported = false;
-        stop_done = false;
-        startup_error.clear();
-    }
-    running.store(false);
-
+void MediaStreamer::Impl::start(StartHandler handler) {
     auto self = shared_from_this();
-    asio::post(strand, [self]() {
-        self->start_on_executor();
+    asio::post(strand, [self, handler = std::move(handler)]() mutable {
+        self->start_on_strand(std::move(handler));
     });
-
-    std::unique_lock<std::mutex> lock(state_mutex);
-    state_cv.wait(lock, [this]() {
-        return startup_done;
-    });
-
-    if (startup_ok)
-        return true;
-
-    if (!startup_error.empty())
-        log() << " media pipeline startup failed: " << startup_error;
-    return false;
 }
 
-void MediaStreamer::Impl::stop() {
-    {
-        const std::lock_guard<std::mutex> lock(state_mutex);
-        if (stop_done)
-            return;
-        stop_requested = true;
-    }
-
-    timer.cancel();
+void MediaStreamer::Impl::stop(StopHandler handler) {
     auto self = shared_from_this();
-    asio::post(strand, [self]() {
-        self->finalize();
-    });
-
-    std::unique_lock<std::mutex> lock(state_mutex);
-    state_cv.wait(lock, [this]() {
-        return stop_done;
+    asio::post(strand, [self, handler = std::move(handler)]() mutable {
+        self->stop_on_strand(std::move(handler));
     });
 }
 
@@ -790,16 +748,60 @@ Logger::Entry MediaStreamer::Impl::log() const {
 }
 
 void MediaStreamer::Impl::complete_startup(bool ok, std::string error_text) {
-    {
-        const std::lock_guard<std::mutex> lock(state_mutex);
-        if (startup_reported)
-            return;
-        startup_done = true;
-        startup_ok = ok;
-        startup_reported = true;
-        startup_error = std::move(error_text);
+    std::vector<StartHandler> handlers = std::move(start_handlers);
+    start_handlers.clear();
+    starting = false;
+    if (!ok && !error_text.empty())
+        log() << " media pipeline startup failed: " << error_text;
+
+    for (auto& handler: handlers) {
+        if (handler)
+            handler(ok, error_text);
     }
-    state_cv.notify_all();
+}
+
+void MediaStreamer::Impl::start_on_strand(StartHandler handler) {
+    if (running.load()) {
+        if (handler)
+            handler(true, {});
+        return;
+    }
+    if (starting) {
+        // Coalesce concurrent start requests behind the same in-flight startup.
+        if (handler)
+            start_handlers.push_back(std::move(handler));
+        return;
+    }
+    if (!finalized) {
+        if (handler)
+            handler(false, "media pipeline is stopping");
+        return;
+    }
+
+    finalized = false;
+    starting = true;
+    stop_requested = false;
+    wall_start_us = AV_NOPTS_VALUE;
+    media_start_us = AV_NOPTS_VALUE;
+    running.store(false);
+    if (handler)
+        start_handlers.push_back(std::move(handler));
+    start_on_executor();
+}
+
+void MediaStreamer::Impl::stop_on_strand(StopHandler handler) {
+    if (finalized) {
+        if (handler)
+            handler();
+        return;
+    }
+
+    if (handler)
+        stop_handlers.push_back(std::move(handler));
+    // Cancel any pacing timer first so finalize can tear the pipeline down synchronously on the strand.
+    stop_requested = true;
+    timer.cancel();
+    finalize();
 }
 
 void MediaStreamer::Impl::start_on_executor() {
@@ -950,22 +952,23 @@ void MediaStreamer::Impl::handle_timer(asio::error_code ec) {
 }
 
 void MediaStreamer::Impl::finalize() {
-    if (running.exchange(false)) {
-        timer.cancel();
-    }
+    if (finalized)
+        return;
+
+    finalized = true;
+    starting = false;
+    stop_requested = false;
+    running.store(false);
+    timer.cancel();
     video.reset();
     audio.reset();
     input.reset();
     packet.unref();
 
-    {
-        const std::lock_guard<std::mutex> lock(state_mutex);
-        stop_done = true;
-        if (!startup_reported) {
-            startup_done = true;
-            startup_ok = false;
-            startup_reported = true;
-        }
+    std::vector<StopHandler> handlers = std::move(stop_handlers);
+    stop_handlers.clear();
+    for (auto& handler: handlers) {
+        if (handler)
+            handler();
     }
-    state_cv.notify_all();
 }
