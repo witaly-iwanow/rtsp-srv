@@ -33,12 +33,11 @@ RUN apt-get update \
         libavutil58 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /media
+WORKDIR /app
+
+RUN mkdir -p /app/media
 
 COPY --from=build /build/rtsp_server /usr/local/bin/rtsp_server
 
-EXPOSE 554/tcp
-EXPOSE 50000-64999/udp
-
 ENTRYPOINT ["/usr/local/bin/rtsp_server"]
-CMD [".", "554"]
+CMD ["./media", "554"]

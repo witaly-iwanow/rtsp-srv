@@ -42,7 +42,7 @@ sudo ./build/rtsp_server
 To play a file with VLC:
 
 ```bash
-vlc rtsp://127.0.0.1:554/media/tos-480p.mp4
+vlc rtsp://127.0.0.1:554/tos-480p.mp4
 ```
 or
 ```bash
@@ -53,7 +53,7 @@ depending on how you launched the server.
 To play the same file with `ffplay`:
 
 ```bash
-ffplay rtsp://127.0.0.1:554/media/tos-480p.mp4
+ffplay rtsp://127.0.0.1:554/tos-480p.mp4
 ```
 
 Note: the `apt`-installed VLC on Debian / Ubuntu does not provide RTSP client support in a useful default configuration for this project. If you want to test with VLC there, either build VLC from source with `--enable-live555` or install VLC from `snap`.
@@ -66,21 +66,17 @@ Build the image:
 docker build -t rtsp-srv:ubuntu24.04 .
 ```
 
-Run it with a media directory mounted into `/media`. The container serves from `.` inside `/media`, matching the native default.
-Besides the RTSP TCP port, publish the UDP server-port range the RTSP `SETUP` replies advertise for RTP/RTCP:
+Run it with your media mounted into `./media` inside the container and use host networking. The image starts the server as `rtsp_server ./media 554`.
 
 ```bash
 docker run --rm -it \
-  -p 554:554/tcp \
-  -p 50000-64999:50000-64999/udp \
-  -v "$PWD:/media:ro" \
+  --network host \
+  -v "$PWD/media:/app/media:ro" \
   rtsp-srv:ubuntu24.04
 ```
-
-The server allocates RTP/RTCP server ports from `50000-64999/udp`, so that range must be reachable from the client when running in Docker bridge mode.
 
 Then open media through RTSP, for example:
 
 ```text
-rtsp://localhost:554/meridian-480.mp4
+vlc rtsp://127.0.0.1:554/tos-480p.mp4
 ```
