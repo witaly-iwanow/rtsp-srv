@@ -64,10 +64,10 @@ std::vector<tcp::endpoint> resolve_bind_endpoints(asio::io_context& io_context, 
 
 }  // namespace
 
-RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service, std::size_t media_threads):
+RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, const std::string& service, std::size_t media_threads):
     media_dir_(media_dir),
     host_(host),
-    service_(std::move(service)),
+    service_(service),
     media_threads_(media_threads),
     media_pool_(media_threads_ > 0 ? media_threads_ : default_media_threads()),
     acceptor_(io_context_),
@@ -159,6 +159,7 @@ void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
         media_dir_,
         media_pool_.get_executor(),
         session_id,
+        port_registry_,
         [this](std::uint32_t id, const std::string& remote) { on_session_closed(id, remote); }));
 
     start_accept();

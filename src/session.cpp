@@ -6,7 +6,6 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -199,62 +198,42 @@ bool parse_client_ports(const std::string& transport, std::uint16_t& rtp, std::u
     }
 }
 
-bool port_is_reserved(std::uint16_t port, const std::vector<std::uint16_t>& reserved_ports) {
-    for (const std::uint16_t reserved: reserved_ports)
-        if (reserved != 0 && reserved == port)
-            return true;
-    return false;
+bool port_is_reserved(std::uint16_t port, const std::vector<std::uint16_t>& reserved) {
+    return std::find(reserved.begin(), reserved.end(), port) != reserved.end();
 }
 
-bool allocate_server_ports(
-    Session::Socket& socket,
-    const std::vector<std::uint16_t>& reserved_ports,
-    std::uint16_t& server_rtp,
-    std::uint16_t& server_rtcp) {
+// Picks `count` OS-assigned ephemeral ports and reserves them in the registry so concurrent
+// sessions can't hand out the same numbers. Returns empty on failure.
+std::vector<std::uint16_t> allocate_ports(Session::Socket& socket, PortRegistry& registry, const std::vector<std::uint16_t>& reserved_ports, std::size_t count) {
     using asio::ip::udp;
 
     asio::error_code ec;
-    const auto local_endpoint = socket.local_endpoint(ec);
+    const auto local = socket.local_endpoint(ec);
     if (ec)
-        return false;
+        return {};
 
-    const udp::endpoint bind_endpoint(local_endpoint.address(), 0);
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        // Pick an OS-assigned even RTP port, then reserve RTP+1 for RTCP.
-        udp::socket rtp_socket(socket.get_executor());
-        rtp_socket.open(bind_endpoint.protocol(), ec);
-        if (ec)
+    std::vector<std::uint16_t> ports;
+    for (int attempt = 0; attempt < 64 && ports.size() < count; ++attempt) {
+        udp::socket s(socket.get_executor());
+        const udp::endpoint ep(local.address(), 0);
+        s.open(ep.protocol(), ec);
+        if (ec) continue;
+        s.bind(ep, ec);
+        if (ec) continue;
+        const std::uint16_t port = s.local_endpoint(ec).port();
+        if (ec || port_is_reserved(port, reserved_ports))
             continue;
-
-        rtp_socket.bind(bind_endpoint, ec);
-        if (ec)
+        if (!registry.try_reserve(port))
             continue;
-
-        const auto rtp_endpoint = rtp_socket.local_endpoint(ec);
-        if (ec)
-            continue;
-
-        const std::uint16_t rtp_port = rtp_endpoint.port();
-        if ((rtp_port & 1u) != 0 || rtp_port == std::numeric_limits<std::uint16_t>::max())
-            continue;
-        if (port_is_reserved(rtp_port, reserved_ports) || port_is_reserved(static_cast<std::uint16_t>(rtp_port + 1), reserved_ports))
-            continue;
-
-        udp::socket rtcp_socket(socket.get_executor());
-        rtcp_socket.open(bind_endpoint.protocol(), ec);
-        if (ec)
-            continue;
-
-        rtcp_socket.bind(udp::endpoint(bind_endpoint.address(), static_cast<std::uint16_t>(rtp_port + 1)), ec);
-        if (ec)
-            continue;
-
-        server_rtp = rtp_port;
-        server_rtcp = static_cast<std::uint16_t>(rtp_port + 1);
-        return true;
+        ports.push_back(port);
     }
 
-    return false;
+    if (ports.size() != count) {
+        for (std::uint16_t port: ports)
+            registry.release(port);
+        return {};
+    }
+    return ports;
 }
 
 // We only support plain UDP unicast RTP/RTCP via RTP/AVP + client_port=...
@@ -334,16 +313,21 @@ std::string endpoint_host(const std::string& endpoint) {
 
 }  // namespace
 
-Session::Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, CloseHandler on_close):
+Session::Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, PortRegistry& port_registry, CloseHandler on_close):
     socket_(std::move(socket)),
     remote_endpoint_(std::move(remote_endpoint)),
     media_dir_(media_dir),
     media_executor_(std::move(media_executor)),
     session_id_(session_id),
+    port_registry_(port_registry),
     on_close_(std::move(on_close)) {}
 
 Session::~Session() {
     streamer_.reset();
+    for (std::uint16_t port: {video_ports_.server_rtp, video_ports_.server_rtcp, audio_ports_.server_rtp, audio_ports_.server_rtcp}) {
+        if (port)
+            port_registry_.release(port);
+    }
 }
 
 void Session::start() {
@@ -508,6 +492,7 @@ void Session::handle_playback_started(bool ok, std::string cseq, std::string) {
 void Session::stop_playback(std::optional<RequestOutcome> response, bool finish_after_stop) {
     if (response)
         pending_stop_response_ = std::move(response);
+
     finish_after_stop_ = finish_after_stop_ || finish_after_stop;
 
     if (!streamer_) {
@@ -798,19 +783,23 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
 
     ports->client_rtp = parsed_rtp;
     ports->client_rtcp = parsed_rtcp;
+    // Release any ports left from a previous SETUP for this track before reassigning.
+    if (ports->server_rtp) port_registry_.release(ports->server_rtp);
+    if (ports->server_rtcp) port_registry_.release(ports->server_rtcp);
+    ports->server_rtp = 0;
+    ports->server_rtcp = 0;
     // Avoid reusing the client's ports when server and client run on the same host.
-    std::vector<std::uint16_t> reserved_ports = {
+    const std::vector<std::uint16_t> reserved_ports = {
         video_ports_.client_rtp,
         video_ports_.client_rtcp,
         audio_ports_.client_rtp,
         audio_ports_.client_rtcp,
-        video_ports_.server_rtp,
-        video_ports_.server_rtcp,
-        audio_ports_.server_rtp,
-        audio_ports_.server_rtcp,
     };
-    if (!allocate_server_ports(socket_, reserved_ports, ports->server_rtp, ports->server_rtcp))
+    const auto allocated = allocate_ports(socket_, port_registry_, reserved_ports, 2);
+    if (allocated.size() != 2)
         return make_response(500, "Internal Server Error", cseq, {}, "");
+    ports->server_rtp = allocated[0];
+    ports->server_rtcp = allocated[1];
     ports->setup = true;
 
     std::string transport_reply = "RTP/AVP;unicast;client_port=" + std::to_string(ports->client_rtp) + "-" + std::to_string(ports->client_rtcp);

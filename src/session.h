@@ -4,6 +4,7 @@
 
 #include "logger.h"
 #include "media_tools.h"
+#include "port_registry.h"
 
 #include <array>
 #include <deque>
@@ -24,7 +25,7 @@ public:
     using MediaExecutor = asio::any_io_executor;
     using CloseHandler = std::function<void(std::uint32_t, const std::string&)>;
 
-    Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, CloseHandler on_close);
+    Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, PortRegistry& port_registry, CloseHandler on_close);
 
     ~Session();
 
@@ -98,6 +99,7 @@ private:
     std::filesystem::path media_dir_;
     MediaExecutor media_executor_;
     std::uint32_t session_id_;
+    PortRegistry& port_registry_;
     CloseHandler on_close_;
     std::string current_media_uri_;
     TrackPorts video_ports_;

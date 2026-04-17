@@ -38,7 +38,7 @@ bool is_supported_audio_codec(AVCodecID codec_id) {
 std::string ffmpeg_error_text(int errnum) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer {};
     av_strerror(errnum, buffer.data(), buffer.size());
-    return std::string(buffer.data());
+    return {buffer.data()};
 }
 
 void ensure_network_initialized() {
@@ -119,7 +119,7 @@ public:
         header_written_ = false;
     }
 
-    bool init(const std::string& url, AVStream* input_stream, const std::string& rtp_cname, bool open_io, int payload_type, std::string& error_text) {
+    bool init(const std::string& url, const AVStream* input_stream, const std::string& rtp_cname, bool open_io, int payload_type, std::string& error_text) {
         reset();
         int err = avformat_alloc_output_context2(&context_, nullptr, "rtp", url.c_str());
         if (err < 0 || context_ == nullptr) {
@@ -232,7 +232,7 @@ public:
         return context_;
     }
 
-    bool init(const char* filter_name, AVStream* stream, std::string& error_text) {
+    bool init(const char* filter_name, const AVStream* stream, std::string& error_text) {
         reset();
 
         const AVBitStreamFilter* filter = av_bsf_get_by_name(filter_name);
@@ -445,7 +445,7 @@ bool fill_track_description(AVStream* stream, bool is_video, MediaTrack& track) 
     return true;
 }
 
-bool build_sdp(AVFormatContext* input, MediaDescription& media, std::string& sdp_out, std::string& error_text) {
+bool build_sdp(const AVFormatContext* input, MediaDescription& media, std::string& sdp_out, std::string& error_text) {
     std::vector<std::unique_ptr<OutputFormatContext>> outputs;
     std::vector<AVFormatContext*> contexts;
 
@@ -564,9 +564,9 @@ bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, 
             }
             std::size_t side_data_size = 0;
             const std::uint8_t* side_data = av_packet_get_side_data(filtered_packet.get(), AV_PKT_DATA_NEW_EXTRADATA, &side_data_size);
-            if (side_data != nullptr && side_data_size > 0) {
+            if (side_data != nullptr && side_data_size > 0)
                 return copy_codec_extradata(stream->codecpar, side_data, static_cast<int>(side_data_size), error_text);
-            }
+
             filtered_packet.unref();
         }
 

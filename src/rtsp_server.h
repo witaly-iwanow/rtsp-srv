@@ -2,6 +2,7 @@
 
 #include <asio.hpp>
 
+#include "port_registry.h"
 #include "session.h"
 
 #include <atomic>
@@ -14,7 +15,7 @@
 // and manages the media thread pool.
 class RtspServer {
 public:
-    RtspServer(const std::filesystem::path& media_dir, const std::string& host, std::string service, std::size_t media_threads = 0);
+    RtspServer(const std::filesystem::path& media_dir, const std::string& host, const std::string& service, std::size_t media_threads = 0);
 
     [[nodiscard]] int run();
 
@@ -39,6 +40,7 @@ private:
     asio::thread_pool media_pool_;
     Acceptor acceptor_;
     asio::signal_set signals_;
+    PortRegistry port_registry_;
     std::unordered_map<std::uint32_t, Session::Ptr> sessions_;
     std::atomic<std::uint32_t> next_session_id_ {1};
     std::atomic<bool> run_called_ {false};
