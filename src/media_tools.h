@@ -43,14 +43,8 @@ public:
     using StartHandler = std::function<void(bool, std::string)>;
     using StopHandler = std::function<void()>;
 
-    MediaStreamer(
-        asio::any_io_executor executor,
-        std::filesystem::path media_path,
-        MediaDescription media,
-        StreamTarget video_target,
-        StreamTarget audio_target,
-        std::string rtp_cname,
-        std::string log_prefix);
+    MediaStreamer(asio::any_io_executor executor, std::filesystem::path media_path, MediaDescription media, StreamTarget video_target,
+                  StreamTarget audio_target, std::string rtp_cname, std::string log_prefix);
 
     ~MediaStreamer();
 

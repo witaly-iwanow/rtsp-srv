@@ -1,4 +1,8 @@
-*.DS_Store
-*.idea
-*.vscode
-**/build*
+/build*
+
+# Ignore all dotfiles/dotdirectories (.DS_Store, .vscode, .idea, etc.)
+.*
+
+# Except these (root level only)
+!.gitignore
+!.clang-format

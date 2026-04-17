@@ -4,9 +4,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <filesystem>
-#include <csignal>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -21,7 +21,7 @@ std::size_t default_media_threads() {
 }
 
 void install_sigpipe_handler() {
-    struct sigaction ignore_sa {};
+    struct sigaction ignore_sa{};
     ignore_sa.sa_handler = SIG_IGN;
     sigemptyset(&ignore_sa.sa_mask);
     ignore_sa.sa_flags = 0;
@@ -62,16 +62,17 @@ std::vector<tcp::endpoint> resolve_bind_endpoints(asio::io_context& io_context, 
     return endpoints;
 }
 
-}  // namespace
+} // namespace
 
-RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, const std::string& service, std::size_t media_threads):
-    media_dir_(media_dir),
+RtspServer::RtspServer(const std::filesystem::path& media_dir, const std::string& host, const std::string& service, std::size_t media_threads)
+  : media_dir_(media_dir),
     host_(host),
     service_(service),
     media_threads_(media_threads),
     media_pool_(media_threads_ > 0 ? media_threads_ : default_media_threads()),
     acceptor_(io_context_),
-    signals_(io_context_, SIGINT, SIGTERM) {}
+    signals_(io_context_, SIGINT, SIGTERM) {
+}
 
 bool RtspServer::open_acceptor() {
     const std::vector<tcp::endpoint> endpoints = resolve_bind_endpoints(io_context_, host_, service_);
@@ -130,9 +131,7 @@ bool RtspServer::open_acceptor() {
 }
 
 void RtspServer::start_accept() {
-    acceptor_.async_accept([this](asio::error_code ec, Socket socket) {
-        handle_accept(ec, std::move(socket));
-    });
+    acceptor_.async_accept([this](asio::error_code ec, Socket socket) { handle_accept(ec, std::move(socket)); });
 }
 
 void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
@@ -153,14 +152,8 @@ void RtspServer::handle_accept(asio::error_code ec, Socket socket) {
         LOG << "remote_endpoint() failed: " << endpoint_ec.message();
 
     const auto session_id = next_session_id_.fetch_add(1, std::memory_order_relaxed);
-    register_session(std::make_shared<Session>(
-        std::move(socket),
-        remote_endpoint,
-        media_dir_,
-        media_pool_.get_executor(),
-        session_id,
-        port_registry_,
-        [this](std::uint32_t id, const std::string& remote) { on_session_closed(id, remote); }));
+    register_session(std::make_shared<Session>(std::move(socket), remote_endpoint, media_dir_, media_pool_.get_executor(), session_id, port_registry_,
+                                               [this](std::uint32_t id, const std::string& remote) { on_session_closed(id, remote); }));
 
     start_accept();
 }
@@ -239,9 +232,7 @@ int RtspServer::run() {
 
     LOG << "Listening on " << host_ << ':' << service_;
     LOG << "Press Ctrl-C to stop";
-    signals_.async_wait([this](asio::error_code ec, int signal_number) {
-        handle_stop_signal(ec, signal_number);
-    });
+    signals_.async_wait([this](asio::error_code ec, int signal_number) { handle_stop_signal(ec, signal_number); });
     start_accept();
 
     io_context_.run();

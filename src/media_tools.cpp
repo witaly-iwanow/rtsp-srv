@@ -3,8 +3,8 @@
 #include "utils.h"
 
 extern "C" {
-#include <libavcodec/bsf.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/time.h>
@@ -26,17 +26,17 @@ constexpr std::uint16_t kDescribeVideoRtpPort = 40000;
 constexpr std::uint16_t kDescribeAudioRtpPort = 40002;
 
 bool is_supported_video_codec(AVCodecID codec_id) {
-    return codec_id == AV_CODEC_ID_HEVC || codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_MPEG2VIDEO
-        || codec_id == AV_CODEC_ID_VP8 || codec_id == AV_CODEC_ID_VP9;
+    return codec_id == AV_CODEC_ID_HEVC || codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_MPEG2VIDEO || codec_id == AV_CODEC_ID_VP8 ||
+           codec_id == AV_CODEC_ID_VP9;
 }
 
 bool is_supported_audio_codec(AVCodecID codec_id) {
-    return codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_MP1
-        || codec_id == AV_CODEC_ID_MP2 || codec_id == AV_CODEC_ID_MP3;
+    return codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_MP1 || codec_id == AV_CODEC_ID_MP2 ||
+           codec_id == AV_CODEC_ID_MP3;
 }
 
 std::string ffmpeg_error_text(int errnum) {
-    std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer {};
+    std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
     av_strerror(errnum, buffer.data(), buffer.size());
     return {buffer.data()};
 }
@@ -57,9 +57,7 @@ public:
     InputFormatContext(const InputFormatContext&) = delete;
     InputFormatContext& operator=(const InputFormatContext&) = delete;
 
-    virtual ~InputFormatContext() {
-        reset();
-    }
+    virtual ~InputFormatContext() { reset(); }
 
     bool open(const std::filesystem::path& media_path, std::string& error_text) {
         reset();
@@ -78,9 +76,7 @@ public:
         return true;
     }
 
-    AVFormatContext* get() const {
-        return context_;
-    }
+    AVFormatContext* get() const { return context_; }
 
     void reset() {
         if (context_) {
@@ -100,9 +96,7 @@ public:
     OutputFormatContext(const OutputFormatContext&) = delete;
     OutputFormatContext& operator=(const OutputFormatContext&) = delete;
 
-    virtual ~OutputFormatContext() {
-        reset();
-    }
+    virtual ~OutputFormatContext() { reset(); }
 
     void reset() {
         if (!context_)
@@ -179,13 +173,9 @@ public:
         return true;
     }
 
-    AVFormatContext* get() const {
-        return context_;
-    }
+    AVFormatContext* get() const { return context_; }
 
-    AVStream* stream() const {
-        return stream_;
-    }
+    AVStream* stream() const { return stream_; }
 
 private:
     AVFormatContext* context_ = nullptr;
@@ -200,18 +190,14 @@ public:
     PacketHandle(const PacketHandle&) = delete;
     PacketHandle& operator=(const PacketHandle&) = delete;
 
-    AVPacket* get() const {
-        return packet_;
-    }
+    AVPacket* get() const { return packet_; }
 
     void unref() {
         if (packet_ != nullptr)
             av_packet_unref(packet_);
     }
 
-    virtual ~PacketHandle() {
-        av_packet_free(&packet_);
-    }
+    virtual ~PacketHandle() { av_packet_free(&packet_); }
 
 private:
     AVPacket* packet_ = nullptr;
@@ -224,13 +210,9 @@ public:
     BitstreamFilterContext(const BitstreamFilterContext&) = delete;
     BitstreamFilterContext& operator=(const BitstreamFilterContext&) = delete;
 
-    virtual ~BitstreamFilterContext() {
-        reset();
-    }
+    virtual ~BitstreamFilterContext() { reset(); }
 
-    AVBSFContext* get() const {
-        return context_;
-    }
+    AVBSFContext* get() const { return context_; }
 
     bool init(const char* filter_name, const AVStream* stream, std::string& error_text) {
         reset();
@@ -331,10 +313,8 @@ std::string make_rtp_url(const StreamTarget& target) {
     // surround with brackets if it contains colons (IPv6)
     if (host.find(':') != std::string::npos)
         host = "[" + host + "]";
-    return "rtp://" + host + ":" + std::to_string(target.client_rtp)
-        + "?pkt_size=1200&rtcpport=" + std::to_string(target.client_rtcp)
-        + "&localrtpport=" + std::to_string(target.server_rtp)
-        + "&localrtcpport=" + std::to_string(target.server_rtcp);
+    return "rtp://" + host + ":" + std::to_string(target.client_rtp) + "?pkt_size=1200&rtcpport=" + std::to_string(target.client_rtcp) +
+           "&localrtpport=" + std::to_string(target.server_rtp) + "&localrtcpport=" + std::to_string(target.server_rtcp);
 }
 
 std::string normalize_sdp(const std::string& raw_sdp) {
@@ -575,7 +555,7 @@ bool derive_aac_audio_specific_config(AVFormatContext* input, AVStream* stream, 
     }
 }
 
-}  // namespace
+} // namespace
 
 bool describe_media(const std::filesystem::path& media_path, MediaDescription& media) {
     InputFormatContext input;
@@ -593,16 +573,14 @@ bool describe_media(const std::filesystem::path& media_path, MediaDescription& m
 
         if (!media.video.present && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (!fill_track_description(stream, true, media.video)) {
-                LOG << "Skipping unsupported video codec " << avcodec_get_name(stream->codecpar->codec_id)
-                    << " in " << media_path;
+                LOG << "Skipping unsupported video codec " << avcodec_get_name(stream->codecpar->codec_id) << " in " << media_path;
             }
             continue;
         }
 
         if (!media.audio.present && stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (!fill_track_description(stream, false, media.audio)) {
-                LOG << "Skipping unsupported audio codec " << avcodec_get_name(stream->codecpar->codec_id)
-                    << " in " << media_path;
+                LOG << "Skipping unsupported audio codec " << avcodec_get_name(stream->codecpar->codec_id) << " in " << media_path;
             }
         }
     }
@@ -657,7 +635,7 @@ struct MediaStreamer::Impl : public std::enable_shared_from_this<MediaStreamer::
     ActiveTrack video;
     ActiveTrack audio;
     PacketHandle packet;
-    std::atomic<bool> running {false};
+    std::atomic<bool> running{false};
     bool finalized = true;
     bool starting = false;
     bool stop_requested = false;
@@ -668,10 +646,8 @@ struct MediaStreamer::Impl : public std::enable_shared_from_this<MediaStreamer::
 };
 
 // Selects the active output track for a packet's stream index, or nullptr if the track is not being streamed.
-static ActiveTrack* select_output_track(
-    const StreamTarget& video_target, const ActiveTrack& video,
-    const StreamTarget& audio_target, const ActiveTrack& audio,
-    int stream_index) {
+static ActiveTrack* select_output_track(const StreamTarget& video_target, const ActiveTrack& video, const StreamTarget& audio_target, const ActiveTrack& audio,
+                                        int stream_index) {
     if (video_target.enabled && stream_index == video.input_index)
         return const_cast<ActiveTrack*>(&video);
     if (audio_target.enabled && stream_index == audio.input_index)
@@ -692,15 +668,9 @@ static bool write_packet(AVPacket* packet, AVStream* input_stream, ActiveTrack& 
     return true;
 }
 
-MediaStreamer::MediaStreamer(
-    asio::any_io_executor executor,
-    std::filesystem::path media_path,
-    MediaDescription media,
-    StreamTarget video_target,
-    StreamTarget audio_target,
-    std::string rtp_cname,
-    std::string log_prefix):
-    impl_(std::make_shared<Impl>(std::move(executor))) {
+MediaStreamer::MediaStreamer(asio::any_io_executor executor, std::filesystem::path media_path, MediaDescription media, StreamTarget video_target,
+                             StreamTarget audio_target, std::string rtp_cname, std::string log_prefix)
+  : impl_(std::make_shared<Impl>(std::move(executor))) {
     impl_->media_path = std::move(media_path);
     impl_->media = std::move(media);
     impl_->video_target = std::move(video_target);
@@ -727,16 +697,12 @@ bool MediaStreamer::running() const {
 
 void MediaStreamer::Impl::start(StartHandler handler) {
     auto self = shared_from_this();
-    asio::post(strand, [self, handler = std::move(handler)]() mutable {
-        self->start_on_strand(std::move(handler));
-    });
+    asio::post(strand, [self, handler = std::move(handler)]() mutable { self->start_on_strand(std::move(handler)); });
 }
 
 void MediaStreamer::Impl::stop(StopHandler handler) {
     auto self = shared_from_this();
-    asio::post(strand, [self, handler = std::move(handler)]() mutable {
-        self->stop_on_strand(std::move(handler));
-    });
+    asio::post(strand, [self, handler = std::move(handler)]() mutable { self->stop_on_strand(std::move(handler)); });
 }
 
 bool MediaStreamer::Impl::running_now() const {
@@ -825,7 +791,8 @@ void MediaStreamer::Impl::start_on_executor() {
 
     if (video_target.enabled) {
         video.input_index = media.video.stream_index;
-        if (!video.output.init(make_rtp_url(video_target), input.get()->streams[video.input_index], rtp_cname, true, media.video.rtp_payload_type, error_text)) {
+        if (!video.output.init(make_rtp_url(video_target), input.get()->streams[video.input_index], rtp_cname, true, media.video.rtp_payload_type,
+                               error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
@@ -834,7 +801,8 @@ void MediaStreamer::Impl::start_on_executor() {
 
     if (audio_target.enabled) {
         audio.input_index = media.audio.stream_index;
-        if (!audio.output.init(make_rtp_url(audio_target), input.get()->streams[audio.input_index], rtp_cname, true, media.audio.rtp_payload_type, error_text)) {
+        if (!audio.output.init(make_rtp_url(audio_target), input.get()->streams[audio.input_index], rtp_cname, true, media.audio.rtp_payload_type,
+                               error_text)) {
             complete_startup(false, std::move(error_text));
             finalize();
             return;
@@ -908,9 +876,7 @@ void MediaStreamer::Impl::schedule_next_packet() {
             if (delay_us > 0) {
                 timer.expires_after(std::chrono::microseconds(delay_us));
                 auto self = shared_from_this();
-                timer.async_wait(asio::bind_executor(strand, [self](asio::error_code ec) {
-                    self->handle_timer(ec);
-                }));
+                timer.async_wait(asio::bind_executor(strand, [self](asio::error_code ec) { self->handle_timer(ec); }));
                 return;
             }
         }

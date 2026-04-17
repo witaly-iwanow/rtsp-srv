@@ -25,7 +25,8 @@ public:
     using MediaExecutor = asio::any_io_executor;
     using CloseHandler = std::function<void(std::uint32_t, const std::string&)>;
 
-    Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, PortRegistry& port_registry, CloseHandler on_close);
+    Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id,
+            PortRegistry& port_registry, CloseHandler on_close);
 
     ~Session();
 
@@ -54,20 +55,11 @@ private:
         bool close_after_response = false;
     };
 
-    enum class StreamState {
-        Idle,
-        Starting,
-        Playing,
-        Stopping
-    };
+    enum class StreamState { Idle, Starting, Playing, Stopping };
 
-    RequestOutcome make_response(
-        int status_code,
-        const std::string& reason,
-        const std::string& cseq,
-        const std::vector<std::pair<std::string, std::string>>& headers,
-        const std::string& body,
-        bool close_after_response = false) const;
+    RequestOutcome make_response(int status_code, const std::string& reason, const std::string& cseq,
+                                 const std::vector<std::pair<std::string, std::string>>& headers, const std::string& body,
+                                 bool close_after_response = false) const;
     void start_read();
     void handle_read(asio::error_code ec, std::size_t bytes_read);
     void process_pending_requests();
@@ -107,7 +99,7 @@ private:
     std::filesystem::path current_media_path_;
     MediaDescription current_media_;
     std::unique_ptr<MediaStreamer> streamer_;
-    std::array<char, 4096> read_buffer_ {};
+    std::array<char, 4096> read_buffer_{};
     std::string pending_requests_;
     std::deque<std::string> write_queue_;
     bool close_after_write_ = false;

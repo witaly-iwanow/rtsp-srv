@@ -28,22 +28,18 @@ public:
     class Entry {
     public:
         // Constructor that only writes the timestamp
-        Entry(Logger& logger) : lock_(logger.mutex_), stream_(logger.stream_) {
-            stream_ << logger.make_timestamp() << " ";
-        }
+        Entry(Logger& logger): lock_(logger.mutex_), stream_(logger.stream_) { stream_ << logger.make_timestamp() << " "; }
 
         // Constructor that writes timestamp and the first value
-        template<typename T>
-        Entry(Logger& logger, const T& val) : Entry(logger) {
+        template <typename T>
+        Entry(Logger& logger, const T& val): Entry(logger) {
             stream_ << val;
         }
 
-        ~Entry() {
-            stream_ << std::endl;
-        }
+        ~Entry() { stream_ << std::endl; }
 
         // Stream insertion operator for chaining
-        template<typename T>
+        template <typename T>
         Entry& operator<<(const T& val) {
             stream_ << val;
             return *this;
@@ -55,7 +51,7 @@ public:
     };
 
     // Enable stream-like syntax: LOG << "message"
-    template<typename T>
+    template <typename T>
     Entry operator<<(const T& val) {
         return Entry(*this, val);
     }
@@ -67,13 +63,11 @@ private:
         const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
         const std::time_t tt = system_clock::to_time_t(now);
 
-        std::tm tm {};
+        std::tm tm{};
         localtime_r(&tt, &tm);
 
         std::ostringstream ts;
-        ts << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M") << ':'
-           << std::put_time(&tm, "%S") << '.' << std::setw(3) << std::setfill('0')
-           << ms.count() << ']';
+        ts << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M") << ':' << std::put_time(&tm, "%S") << '.' << std::setw(3) << std::setfill('0') << ms.count() << ']';
         return ts.str();
     }
 

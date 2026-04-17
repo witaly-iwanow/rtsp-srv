@@ -204,7 +204,8 @@ bool port_is_reserved(std::uint16_t port, const std::vector<std::uint16_t>& rese
 
 // Picks `count` OS-assigned ephemeral ports and reserves them in the registry so concurrent
 // sessions can't hand out the same numbers. Returns empty on failure.
-std::vector<std::uint16_t> allocate_ports(Session::Socket& socket, PortRegistry& registry, const std::vector<std::uint16_t>& reserved_ports, std::size_t count) {
+std::vector<std::uint16_t> allocate_ports(Session::Socket& socket, PortRegistry& registry, const std::vector<std::uint16_t>& reserved_ports,
+                                          std::size_t count) {
     using asio::ip::udp;
 
     asio::error_code ec;
@@ -217,9 +218,11 @@ std::vector<std::uint16_t> allocate_ports(Session::Socket& socket, PortRegistry&
         udp::socket s(socket.get_executor());
         const udp::endpoint ep(local.address(), 0);
         s.open(ep.protocol(), ec);
-        if (ec) continue;
+        if (ec)
+            continue;
         s.bind(ep, ec);
-        if (ec) continue;
+        if (ec)
+            continue;
         const std::uint16_t port = s.local_endpoint(ec).port();
         if (ec || port_is_reserved(port, reserved_ports))
             continue;
@@ -311,16 +314,18 @@ std::string endpoint_host(const std::string& endpoint) {
     return endpoint.substr(0, colon);
 }
 
-}  // namespace
+} // namespace
 
-Session::Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id, PortRegistry& port_registry, CloseHandler on_close):
-    socket_(std::move(socket)),
+Session::Session(Socket socket, std::string remote_endpoint, const std::filesystem::path& media_dir, MediaExecutor media_executor, std::uint32_t session_id,
+                 PortRegistry& port_registry, CloseHandler on_close)
+  : socket_(std::move(socket)),
     remote_endpoint_(std::move(remote_endpoint)),
     media_dir_(media_dir),
     media_executor_(std::move(media_executor)),
     session_id_(session_id),
     port_registry_(port_registry),
-    on_close_(std::move(on_close)) {}
+    on_close_(std::move(on_close)) {
+}
 
 Session::~Session() {
     streamer_.reset();
@@ -379,13 +384,9 @@ void Session::reset_track_state() {
     current_media_ = {};
 }
 
-Session::RequestOutcome Session::make_response(
-    int status_code,
-    const std::string& reason,
-    const std::string& cseq,
-    const std::vector<std::pair<std::string, std::string>>& headers,
-    const std::string& body,
-    bool close_after_response) const {
+Session::RequestOutcome Session::make_response(int status_code, const std::string& reason, const std::string& cseq,
+                                               const std::vector<std::pair<std::string, std::string>>& headers, const std::string& body,
+                                               bool close_after_response) const {
     std::ostringstream response;
     response << "RTSP/1.0 " << status_code << ' ' << reason << "\r\n";
     response << "CSeq: " << cseq << "\r\n";
@@ -400,9 +401,7 @@ Session::RequestOutcome Session::make_response(
 
 void Session::start_read() {
     auto self = shared_from_this();
-    socket_.async_read_some(asio::buffer(read_buffer_), [self](asio::error_code ec, std::size_t bytes_read) {
-        self->handle_read(ec, bytes_read);
-    });
+    socket_.async_read_some(asio::buffer(read_buffer_), [self](asio::error_code ec, std::size_t bytes_read) { self->handle_read(ec, bytes_read); });
 }
 
 void Session::handle_read(asio::error_code ec, std::size_t bytes_read) {
@@ -567,9 +566,8 @@ void Session::start_write() {
         return;
 
     auto self = shared_from_this();
-    asio::async_write(socket_, asio::buffer(write_queue_.front()), [self](asio::error_code ec, std::size_t bytes_written) {
-        self->handle_write(ec, bytes_written);
-    });
+    asio::async_write(socket_, asio::buffer(write_queue_.front()),
+                      [self](asio::error_code ec, std::size_t bytes_written) { self->handle_write(ec, bytes_written); });
 }
 
 void Session::handle_write(asio::error_code ec, std::size_t) {
@@ -690,7 +688,8 @@ bool Session::create_streamer() {
         audio_target.server_rtcp = audio_ports_.server_rtcp;
     }
 
-    streamer_ = std::make_unique<MediaStreamer>(media_executor_, current_media_path_, current_media_, video_target, audio_target, make_rtp_cname(session_id_), log_prefix());
+    streamer_ = std::make_unique<MediaStreamer>(media_executor_, current_media_path_, current_media_, video_target, audio_target, make_rtp_cname(session_id_),
+                                                log_prefix());
     return true;
 }
 
@@ -717,7 +716,8 @@ Session::RequestOutcome Session::handle_describe(const std::string& uri, const s
     return make_response(200, "OK", cseq, {{"Content-Base", base}, {"Content-Type", "application/sdp"}}, current_media_.sdp);
 }
 
-Session::RequestOutcome Session::handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport, const std::string& session_header) {
+Session::RequestOutcome Session::handle_setup(const std::string& uri, const std::string& cseq, const std::string& transport,
+                                              const std::string& session_header) {
     if (stream_state_ == StreamState::Starting || stream_state_ == StreamState::Stopping)
         return make_response(455, "Method Not Valid In This State", cseq, {}, "");
 
@@ -784,16 +784,18 @@ Session::RequestOutcome Session::handle_setup(const std::string& uri, const std:
     ports->client_rtp = parsed_rtp;
     ports->client_rtcp = parsed_rtcp;
     // Release any ports left from a previous SETUP for this track before reassigning.
-    if (ports->server_rtp) port_registry_.release(ports->server_rtp);
-    if (ports->server_rtcp) port_registry_.release(ports->server_rtcp);
+    if (ports->server_rtp)
+        port_registry_.release(ports->server_rtp);
+    if (ports->server_rtcp)
+        port_registry_.release(ports->server_rtcp);
     ports->server_rtp = 0;
     ports->server_rtcp = 0;
     // Avoid reusing the client's ports when server and client run on the same host.
     const std::vector<std::uint16_t> reserved_ports = {
-        video_ports_.client_rtp,
-        video_ports_.client_rtcp,
-        audio_ports_.client_rtp,
-        audio_ports_.client_rtcp,
+            video_ports_.client_rtp,
+            video_ports_.client_rtcp,
+            audio_ports_.client_rtp,
+            audio_ports_.client_rtcp,
     };
     const auto allocated = allocate_ports(socket_, port_registry_, reserved_ports, 2);
     if (allocated.size() != 2)

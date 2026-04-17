@@ -1,24 +1,20 @@
 #pragma once
 
 #include <algorithm>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <string>
 #include <string_view>
 
 namespace util {
 
 inline auto to_lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
 
 inline auto to_upper(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::toupper(c));
-    });
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return value;
 }
 
@@ -45,4 +41,4 @@ inline bool parse_int(const std::string_view text, int& out) {
     return true;
 }
 
-}  // namespace util
+} // namespace util

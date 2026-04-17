@@ -42,7 +42,7 @@ private:
     asio::signal_set signals_;
     PortRegistry port_registry_;
     std::unordered_map<std::uint32_t, Session::Ptr> sessions_;
-    std::atomic<std::uint32_t> next_session_id_ {1};
-    std::atomic<bool> run_called_ {false};
+    std::atomic<std::uint32_t> next_session_id_{1};
+    std::atomic<bool> run_called_{false};
     bool shutting_down_ = false;
 };
